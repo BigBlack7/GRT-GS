@@ -99,7 +99,14 @@ def render_set_train(model_path, views, gaussians, pipeline, background, save_im
    
 def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, save_ims: bool, op, indirect):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree)
+        gaussians = GaussianModel(
+            dataset.sh_degree,
+            anchor_feat_dim=dataset.anchor_feat_dim,
+            idiv_hidden_dim=dataset.idiv_hidden_dim,
+            iiv_hidden_dim=dataset.iiv_hidden_dim,
+            use_idiv=dataset.use_idiv,
+            use_iiv=dataset.use_iiv,
+        )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]

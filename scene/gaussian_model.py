@@ -77,9 +77,15 @@ class GaussianModel:
         self.asg_param = init_predefined_omega(4, 8)
 
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int, anchor_feat_dim: int = 32, idiv_hidden_dim: int = 64, iiv_hidden_dim: int = 64,
+                 use_idiv: bool = True, use_iiv: bool = False):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
+        self.anchor_feat_dim = anchor_feat_dim
+        self.idiv_hidden_dim = idiv_hidden_dim
+        self.iiv_hidden_dim = iiv_hidden_dim
+        self.use_idiv = use_idiv
+        self.use_iiv = use_iiv
         self._xyz = torch.empty(0)
         self._refl_strength = torch.empty(0) 
         self._ori_color = torch.empty(0) 
@@ -100,6 +106,9 @@ class GaussianModel:
 
         self._normal1 = torch.empty(0)
         self._normal2 = torch.empty(0)
+        self._anchor_feat = torch.empty(0)
+        self.mlp_idiv = None
+        self.mlp_iiv = None
 
         self.optimizer = None
         self.free_radius = 0    
@@ -120,6 +129,27 @@ class GaussianModel:
         self.env_directions2 = get_env_direction2(self.env_H, self.env_W)
         self.ray_tracer = None
         self.setup_functions()
+        if self.use_idiv:
+            self.mlp_idiv = self._build_idiv_mlp()
+        if self.use_iiv:
+            self.mlp_iiv = self._build_iiv_mlp()
+
+    def _build_idiv_mlp(self):
+        mlp = nn.Sequential(
+            nn.Linear(self.anchor_feat_dim + 1, self.idiv_hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(self.idiv_hidden_dim, 3),
+        ).cuda()
+        torch.nn.init.constant_(mlp[-1].bias, 1.0)
+        return mlp
+
+    def _build_iiv_mlp(self):
+        return nn.Sequential(
+            nn.Linear(self.anchor_feat_dim + 6, self.iiv_hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(self.iiv_hidden_dim, 3),
+            nn.Softplus(),
+        ).cuda()
 
     def capture(self):
         return (
@@ -145,36 +175,73 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._anchor_feat,
+            self.mlp_idiv.state_dict() if self.mlp_idiv is not None else None,
+            self.mlp_iiv.state_dict() if self.mlp_iiv is not None else None,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._refl_strength,  
-        self._metalness, 
-        self._roughness, 
-        self._ori_color, 
-        self._diffuse_color,
-        self._features_dc, 
-        self._features_rest,
-        self._indirect_dc, 
-        self._indirect_rest,
-        self._indirect_asg,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self._normal1,  
-        self._normal2,  
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) >= 25:
+            (self.active_sh_degree,
+            self._xyz,
+            self._refl_strength,
+            self._metalness,
+            self._roughness,
+            self._ori_color,
+            self._diffuse_color,
+            self._features_dc,
+            self._features_rest,
+            self._indirect_dc,
+            self._indirect_rest,
+            self._indirect_asg,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal1,
+            self._normal2,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._anchor_feat,
+            idiv_state,
+            iiv_state) = model_args
+        else:
+            (self.active_sh_degree,
+            self._xyz,
+            self._refl_strength,
+            self._metalness,
+            self._roughness,
+            self._ori_color,
+            self._diffuse_color,
+            self._features_dc,
+            self._features_rest,
+            self._indirect_dc,
+            self._indirect_rest,
+            self._indirect_asg,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal1,
+            self._normal2,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            self._anchor_feat = torch.zeros((self._xyz.shape[0], self.anchor_feat_dim), device="cuda")
+            idiv_state = None
+            iiv_state = None
         self._indirect_asg = nn.Parameter(torch.zeros(self._rotation.shape[0], 32, 5, device='cuda').requires_grad_(True))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         # self.optimizer.load_state_dict(opt_dict)
+        if self.use_idiv and self.mlp_idiv is not None and idiv_state is not None:
+            self.mlp_idiv.load_state_dict(idiv_state)
+        if self.use_iiv and self.mlp_iiv is not None and iiv_state is not None:
+            self.mlp_iiv.load_state_dict(iiv_state)
 
     def set_opacity_lr(self, lr):   
         for param_group in self.optimizer.param_groups:
@@ -202,6 +269,10 @@ class GaussianModel:
         return self.refl_activation(self._refl_strength)
 
     @property
+    def get_metalness(self):
+        return self.metalness_ativation(self._metalness)
+
+    @property
     def get_rough(self): 
         return self.roughness_activation(self._roughness)
 
@@ -212,6 +283,22 @@ class GaussianModel:
     @property
     def get_diffuse_color(self): 
         return self.color_activation(self._diffuse_color)
+
+    @property
+    def get_anchor_feat(self):
+        return self._anchor_feat
+
+    def get_idiv(self, metalness=None):
+        if self.mlp_idiv is None:
+            return None
+        if metalness is None:
+            metalness = self.get_metalness
+        return self.mlp_idiv(torch.cat([self._anchor_feat, metalness], dim=-1))
+
+    def get_iiv(self, reflection, normals):
+        if self.mlp_iiv is None:
+            return None
+        return self.mlp_iiv(torch.cat([self._anchor_feat, reflection, normals], dim=-1))
     
 
     def get_normal(self, scaling_modifier, dir_pp_normalized, return_delta=False): 
@@ -344,6 +431,8 @@ class GaussianModel:
         normals2 = np.copy(normals1)
         self._normal1 = nn.Parameter(torch.from_numpy(normals1).to(self._xyz.device).requires_grad_(True))
         self._normal2 = nn.Parameter(torch.from_numpy(normals2).to(self._xyz.device).requires_grad_(True))
+        anchor_feat = torch.randn((self._xyz.shape[0], self.anchor_feat_dim), device="cuda") * 0.01
+        self._anchor_feat = nn.Parameter(anchor_feat.requires_grad_(True))
 
         self.env_map = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
         self.env_map_2 = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
@@ -381,6 +470,12 @@ class GaussianModel:
             {'params': [self._indirect_rest], 'lr': training_args.indirect_lr / 20.0, "name": "ind_rest"},
             {'params': [self._indirect_asg], 'lr': training_args.asg_lr, "name": "ind_asg"},
         ])
+        if self._anchor_feat.numel() > 0:
+            l.append({'params': [self._anchor_feat], 'lr': training_args.anchor_feat_lr, "name": "anchor_feat"})
+        if self.mlp_idiv is not None:
+            l.append({'params': self.mlp_idiv.parameters(), 'lr': training_args.idiv_mlp_lr, "name": "idiv_mlp"})
+        if self.mlp_iiv is not None:
+            l.append({'params': self.mlp_iiv.parameters(), 'lr': training_args.iiv_mlp_lr, "name": "iiv_mlp"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -415,6 +510,8 @@ class GaussianModel:
             l.append('ori_color_{}'.format(i))
         for i in range(self._diffuse_color.shape[1]):  # Add diffuse_color attributes
             l.append('diffuse_color_{}'.format(i))
+        for i in range(self._anchor_feat.shape[1]):
+            l.append('anchor_feat_{}'.format(i))
 
 
         for i in range(self._scaling.shape[1]):
@@ -438,6 +535,7 @@ class GaussianModel:
         roughness = self._roughness.detach().cpu().numpy()    
         ori_color = self._ori_color.detach().cpu().numpy()    
         diffuse_color = self._diffuse_color.detach().cpu().numpy()  
+        anchor_feat = self._anchor_feat.detach().cpu().numpy()
         
         normals1 = self._normal1.detach().cpu().numpy()
         normals2 = self._normal2.detach().cpu().numpy() 
@@ -450,7 +548,7 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
 
-        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, anchor_feat, scale, rotation), axis=1)
 
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
@@ -622,6 +720,14 @@ class GaussianModel:
         diffuse_color = np.stack((np.asarray(plydata.elements[0]['diffuse_color_0']),
                                 np.asarray(plydata.elements[0]['diffuse_color_1']),
                                 np.asarray(plydata.elements[0]['diffuse_color_2'])),  axis=1)
+        anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("anchor_feat_")]
+        anchor_feat_names = sorted(anchor_feat_names, key=lambda x: int(x.split('_')[-1]))
+        if anchor_feat_names:
+            anchor_feat = np.zeros((xyz.shape[0], len(anchor_feat_names)))
+            for idx, attr_name in enumerate(anchor_feat_names):
+                anchor_feat[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        else:
+            anchor_feat = np.random.randn(xyz.shape[0], self.anchor_feat_dim) * 0.01
         
         roughness = np.asarray(plydata.elements[0]["roughness"])[..., np.newaxis] # #
         metalness = np.asarray(plydata.elements[0]["metalness"])[..., np.newaxis] # #
@@ -706,6 +812,7 @@ class GaussianModel:
         self._roughness = nn.Parameter(torch.tensor(roughness, dtype=torch.float, device="cuda").requires_grad_(True))   # #
         self._ori_color = nn.Parameter(torch.tensor(ori_color, dtype=torch.float, device="cuda").requires_grad_(True))   # #
         self._diffuse_color = nn.Parameter(torch.tensor(diffuse_color, dtype=torch.float, device="cuda").requires_grad_(True))   # #
+        self._anchor_feat = nn.Parameter(torch.tensor(anchor_feat, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._normal1 = nn.Parameter(torch.tensor(normal1, dtype=torch.float, device="cuda").requires_grad_(True))       # #
         self._normal2 = nn.Parameter(torch.tensor(normal2, dtype=torch.float, device="cuda").requires_grad_(True))       # #
@@ -740,7 +847,8 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] == "mlp" or group["name"] == "env" or group["name"] == "env2": continue   # #
+            if group["name"] in {"mlp", "env", "env2", "idiv_mlp", "iiv_mlp"}:
+                continue   # #
             stored_state = self.optimizer.state.get(group['params'][0], None)
 
             if stored_state is not None:
@@ -779,6 +887,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if "anchor_feat" in optimizable_tensors:
+            self._anchor_feat = optimizable_tensors["anchor_feat"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -788,7 +898,8 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] == "mlp" or group["name"] == "env" or group["name"] == "env2": continue   # #
+            if group["name"] in {"mlp", "env", "env2", "idiv_mlp", "iiv_mlp"}:
+                continue   # #
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -808,7 +919,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
+    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_anchor_feat, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
         d = {"xyz": new_xyz,
              
         "refl_strength": new_refl_strength,    # #
@@ -816,6 +927,7 @@ class GaussianModel:
         "roughness": new_roughness,    # #
         "ori_color": new_ori_color,    # #
         "diffuse_color": new_diffuse_color,    # #
+        "anchor_feat": new_anchor_feat,
         "normal1" : new_normal1,       # #
         "normal2" : new_normal2,       # #
 
@@ -838,6 +950,8 @@ class GaussianModel:
         self._roughness = optimizable_tensors['roughness']    # #
         self._ori_color = optimizable_tensors['ori_color']    # #
         self._diffuse_color = optimizable_tensors['diffuse_color']    # #
+        if "anchor_feat" in optimizable_tensors:
+            self._anchor_feat = optimizable_tensors["anchor_feat"]
         self._normal1 = optimizable_tensors["normal1"]        # #
         self._normal2 = optimizable_tensors["normal2"]        # #
 
@@ -876,6 +990,7 @@ class GaussianModel:
         new_refl_strength = self._refl_strength[selected_pts_mask].repeat(N,1)   # #
         new_ori_color = self._ori_color[selected_pts_mask].repeat(N,1)   # #
         new_diffuse_color = self._diffuse_color[selected_pts_mask].repeat(N,1)   # #
+        new_anchor_feat = self._anchor_feat[selected_pts_mask].repeat(N,1)
         new_roughness = self._roughness[selected_pts_mask].repeat(N,1)   # #
         new_metalness = self._metalness[selected_pts_mask].repeat(N,1)   # #
         new_normal1 = self._normal1[selected_pts_mask].repeat(N,1)        # #
@@ -890,7 +1005,7 @@ class GaussianModel:
         
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_anchor_feat, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -908,6 +1023,7 @@ class GaussianModel:
         new_roughness = self._roughness[selected_pts_mask]   # #
         new_ori_color = self._ori_color[selected_pts_mask]   # #
         new_diffuse_color = self._diffuse_color[selected_pts_mask]   # #
+        new_anchor_feat = self._anchor_feat[selected_pts_mask]
         new_normal1 = self._normal1[selected_pts_mask]       # #
         new_normal2 = self._normal2[selected_pts_mask]       # #
 
@@ -922,7 +1038,7 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_anchor_feat, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

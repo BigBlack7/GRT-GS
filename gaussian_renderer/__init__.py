@@ -268,25 +268,19 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         colors_precomp = override_color
 
     # indirect light
+    dir_pp = (pc.get_xyz - viewpoint_camera.camera_center)
+    dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+    normals = pc.get_normal(scaling_modifier, dir_pp_normalized)
+    w_o = -dir_pp_normalized
+    reflection = 2 * torch.sum(normals * w_o, dim=1, keepdim=True) * normals - w_o
+    reflection = F.normalize(reflection, dim=-1)
     if pipe.use_asg:
-        dir_pp = (pc.get_xyz - viewpoint_camera.camera_center)
-        dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-        
-        splat2world = pc.get_covariance(scaling_modifier)
-        normals = pc.get_normal(scaling_modifier, dir_pp_normalized)
-        w_o = -dir_pp_normalized
-        reflection = 2 * torch.sum(normals * w_o, dim=1, keepdim=True) * normals - w_o
-        
         rotation_normal = rotation_between_z(normals).transpose(-1, -2)
         reflection_cartesian = (rotation_normal @ reflection[..., None])[..., 0]
-        
-        # import pdb;pdb.set_trace()
         omega, omega_la, omega_mu = pc.asg_param
         asg = pc.get_asg
         ep, la, mu = torch.split(asg, [3, 1, 1], dim=-1)
-        
         Smooth = F.relu((reflection_cartesian[:, None] * omega[None]).sum(dim=-1, keepdim=True))
-
         ep = torch.exp(ep-3)
         la = F.softplus(la - 1)
         mu = F.softplus(mu - 1)
@@ -294,23 +288,26 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         indirect_asg = ep * Smooth * torch.exp(exp_input)
         indirect = indirect_asg.sum(dim=1).clamp_min(0.0)
     else:
-        dir_pp = (pc.get_xyz - viewpoint_camera.camera_center)
-        dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-        normals = pc.get_normal(scaling_modifier, dir_pp_normalized)
-        w_o = -dir_pp_normalized
-        reflection = 2 * torch.sum(normals * w_o, dim=1, keepdim=True) * normals - w_o
-        # import pdb;pdb.set_trace()
         shs_indirect = pc.get_indirect.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
         sh2indirect = eval_sh(3, shs_indirect, reflection)
         indirect = torch.clamp_min(sh2indirect, 0.0)
+    if pc.use_iiv and pc.mlp_iiv is not None:
+        iiv = pc.get_iiv(reflection, normals)
+        indirect = torch.clamp_min(iiv, 0.0)
     
 
+    idiv = None
+    if pc.use_idiv:
+        idiv = pc.get_idiv()
+    features = torch.cat((refl, roughness, ori_color, indirect), dim=-1)
+    if idiv is not None:
+        features = torch.cat((features, idiv), dim=-1)
     contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
         colors_precomp = colors_precomp,
-        features = torch.cat((refl, roughness, ori_color, indirect), dim=-1),
+        features = features,
         opacities = opacity,
         scales = scales,
         rotations = rotations,
@@ -323,6 +320,9 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     roughness = rendered_features[1:2]
     albedo = rendered_features[2:5]
     indirect_light = rendered_features[5:8]
+    idiv_map = None
+    if idiv is not None:
+        idiv_map = rendered_features[8:11]
 
 
     # 2DGS normal and regularizations
@@ -344,6 +344,11 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth)
 
     # Integrate the final image
+    if idiv_map is not None:
+        idiv_val = idiv_map.permute(1, 2, 0)
+        idiv_dot = (normal_map * idiv_val).sum(dim=-1, keepdim=True).clamp_min(0.0)
+        idiv_dot = idiv_dot.permute(2, 0, 1)
+        base_color = albedo * idiv_dot
     final_image = (1-refl_strength) * base_color + specular 
     
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
@@ -378,6 +383,8 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
             'surf_normal': surf_normal
     }
     
+    if idiv_map is not None:
+        results.update({"idiv_map": idiv_map})
     if opt.indirect:
         results.update(extra_dict)
 
@@ -473,39 +480,35 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     # indirect light
     if pipe.use_asg:
         dir_pp = (pc.get_xyz - viewpoint_camera.camera_center)
-        dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-        
-        splat2world = pc.get_covariance(scaling_modifier)
+        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
         normals = pc.get_normal(scaling_modifier, dir_pp_normalized)
         w_o = -dir_pp_normalized
         reflection = 2 * torch.sum(normals * w_o, dim=1, keepdim=True) * normals - w_o
-        
         rotation_normal = rotation_between_z(normals).transpose(-1, -2)
         reflection_cartesian = (rotation_normal @ reflection[..., None])[..., 0]
-        
-        # import pdb;pdb.set_trace()
         omega, omega_la, omega_mu = pc.asg_param
         asg = pc.get_asg
         ep, la, mu = torch.split(asg, [3, 1, 1], dim=-1)
         Smooth = F.relu((reflection_cartesian[:, None] * omega[None]).sum(dim=-1, keepdim=True))
-
         ep = torch.exp(ep-3)
         la = F.softplus(la - 1)
         mu = F.softplus(mu - 1)
         exp_input = -la * (omega_la[None] * reflection_cartesian[:, None]).sum(dim=-1, keepdim=True).pow(2) - mu * (omega_mu[None] * reflection_cartesian[:, None]).sum(dim=-1, keepdim=True).pow(2)
         indirect_asg = ep * Smooth * torch.exp(exp_input)
         indirect = indirect_asg.sum(dim=1).clamp_min(0.0)
-
     else:
         dir_pp = (pc.get_xyz - viewpoint_camera.camera_center)
-        dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
         normals = pc.get_normal(scaling_modifier, dir_pp_normalized)
         w_o = -dir_pp_normalized
         reflection = 2 * torch.sum(normals * w_o, dim=1, keepdim=True) * normals - w_o
-        # import pdb;pdb.set_trace()
         shs_indirect = pc.get_indirect.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
         sh2indirect = eval_sh(3, shs_indirect, reflection)
         indirect = torch.clamp_min(sh2indirect, 0.0)
+    reflection = F.normalize(reflection, dim=-1)
+    if pc.use_iiv and pc.mlp_iiv is not None:
+        iiv = pc.get_iiv(reflection, normals)
+        indirect = torch.clamp_min(iiv, 0.0)
 
 
     if opt.indirect:
@@ -523,6 +526,11 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         features = torch.cat((roughness, refl, diffuse, specular, ori_color, visibility, indirect, direct_light), dim=-1)
     else:
         features = torch.cat((roughness, refl, diffuse, specular, ori_color), dim=-1)
+    idiv = None
+    if pc.use_idiv:
+        idiv = pc.get_idiv()
+        if idiv is not None:
+            features = torch.cat((features, idiv), dim=-1)
 
     contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
         means3D = means3D,
@@ -543,11 +551,16 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     render_refl_strength = rendered_features[1:2]   # (1,H,W)
     render_diffuse_color = rendered_features[2:5]
     render_specular_color = rendered_features[5:8]
-    render_ori_color = rendered_features[8:11]  #
+    render_ori_color = rendered_features[8:11]
+    idiv_map = None
     if opt.indirect:
         render_visibility = rendered_features[11:12]
         render_indirect = rendered_features[12:15] 
-        render_direct = rendered_features[15:18]     
+        render_direct = rendered_features[15:18]
+        if idiv is not None:
+            idiv_map = rendered_features[18:21]
+    elif idiv is not None:
+        idiv_map = rendered_features[11:14]
 
 
 
@@ -562,6 +575,13 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     surf_normal = regularizations['surf_normal']
 
 
+
+    if idiv_map is not None:
+        normal_map = render_normal / render_alpha.clamp_min(1e-6)
+        idiv_val = idiv_map / render_alpha.clamp_min(1e-6)
+        idiv_dot = (normal_map * idiv_val).sum(dim=0, keepdim=True).clamp_min(0.0)
+        render_diffuse_color = render_ori_color * idiv_dot
+        full_color = (1 - render_refl_strength) * render_diffuse_color + render_specular_color
 
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
     if srgb: 
@@ -596,6 +616,8 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     if delta_normal_norm is not None:
         results.update({"delta_normal_norm": delta_normal_norm.repeat(3,1,1)})
 
+    if idiv_map is not None:
+        results.update({"idiv_map": idiv_map})
     if opt.indirect:
         results.update(
             {

@@ -58,7 +58,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         REFL_MSK_LOSS_W = 0.4
 
 
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(
+        dataset.sh_degree,
+        anchor_feat_dim=dataset.anchor_feat_dim,
+        idiv_hidden_dim=dataset.idiv_hidden_dim,
+        iiv_hidden_dim=dataset.iiv_hidden_dim,
+        use_idiv=dataset.use_idiv,
+        use_iiv=dataset.use_iiv,
+    )
     set_gaussian_para(gaussians, opt, vol=(opt.volume_render_until_iter > opt.init_until_iter)) # #
     scene = Scene(dataset, gaussians)  # init all parameters(pos, scale, rot...) from pcds
     gaussians.training_setup(opt)
