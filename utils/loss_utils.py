@@ -136,6 +136,17 @@ def calculate_loss(viewpoint_camera, pc, render_pkg, opt, iteration):
     else:
         tb_dict["loss_depth_smooth"] = torch.zeros_like(loss)
 
+    if opt.lambda_idiv > 0 and iteration > opt.normal_smooth_from_iter:
+        idiv_map = render_pkg.get("idiv_map")
+        if idiv_map is not None:
+            loss_idiv = first_order_edge_aware_loss(idiv_map, gt_image)
+            tb_dict["loss_idiv"] = loss_idiv.item()
+            loss = loss + opt.lambda_idiv * loss_idiv
+        else:
+            tb_dict["loss_idiv"] = torch.zeros_like(loss)
+    else:
+        tb_dict["loss_idiv"] = torch.zeros_like(loss)
+
     
     tb_dict["loss"] = loss.item()
     

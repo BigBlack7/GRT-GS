@@ -35,6 +35,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    normal: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -162,7 +163,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, lod=0, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -179,8 +180,16 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        if lod > 0:
+            if lod < 50:
+                train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx > lod]
+                test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx <= lod]
+            else:
+                train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx <= lod]
+                test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx > lod]
+        else:
+            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
@@ -212,7 +221,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", undistorted=False):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -239,19 +248,31 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
 
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            if undistorted and "fl_x" in frame:
+                mtx = np.array(
+                    [
+                        [frame["fl_x"], 0, frame["cx"]],
+                        [0, frame["fl_y"], frame["cy"]],
+                        [0, 0, 1.0],
+                    ],
+                    dtype=np.float32,
+                )
+                dist = np.array([frame["k1"], frame["k2"], frame["p1"], frame["p2"], frame.get("k3", 0.0)], dtype=np.float32)
+                im_data = np.array(image.convert("RGB"))
+                arr = cv2.undistort(im_data / 255.0, mtx, dist, None, mtx)
+                image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+            else:
+                im_data = np.array(image.convert("RGBA"))
+                bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                norm_data = im_data / 255.0
+                arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+                image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
             fo = fov2focal(fovx, image.size[0])
 
             W,H = image.size[0], image.size[1]
             K = np.array([
-                [fo, 0, W/2],
-                [0, fo, H/2],
+                [fo, 0, W / 2],
+                [0, fo, H / 2],
                 [0, 0, 1],
             ])
 
@@ -259,17 +280,26 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovY = fovy 
             FovX = fovx
 
+            normal_arr = None
+            normal_image_path = os.path.join(path, "normal", image_name + "_normal.png")
+            if os.path.exists(normal_image_path):
+                normal_image = Image.open(normal_image_path)
+                normal_im_data = np.array(normal_image.convert("RGBA"))
+                norm_normal_data = normal_im_data / 255.0
+                normal_arr = norm_normal_data[:, :, :3] * norm_normal_data[:, :, 3:4]
+
             # For blender datasets, we consider its camera center offset is zero (ideal camera)
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            normal=normal_arr))
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", undistorted=False):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, undistorted=undistorted)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension, undistorted=undistorted)
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)

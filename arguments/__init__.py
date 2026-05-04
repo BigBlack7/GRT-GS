@@ -56,6 +56,11 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
+        self.anchor_feat_dim = 32
+        self.idiv_hidden_dim = 64
+        self.iiv_hidden_dim = 64
+        self.use_idiv = True
+        self.use_iiv = False
         
         # Paths
         self._source_path = ""
@@ -65,6 +70,8 @@ class ModelParams(ParamGroup):
         # Device Settings
         self.data_device = "cuda"
         self.eval = False
+        self.lod = 0
+        self.undistorted = False
 
         # EnvLight Settings
         self.envmap_max_res = 128
@@ -117,6 +124,9 @@ class OptimizationParams(ParamGroup):
         self.normal_lr = 0.006
 
         self.envmap_cubemap_lr = 0.01
+        self.anchor_feat_lr = 0.0075
+        self.idiv_mlp_lr = 0.0075
+        self.iiv_mlp_lr = 0.0075
         
         # Densification Settings
         self.percent_dense = 0.01
@@ -127,6 +137,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_normal_render_depth = 0.05
         self.lambda_normal_smooth = 0.0
         self.lambda_depth_smooth = 0.0
+        self.lambda_idiv = 0.0
 
 
         # initial values
