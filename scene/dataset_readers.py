@@ -117,7 +117,12 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path.replace('.JPG', '.jpg'))
+        if not os.path.exists(image_path):
+            alt_path = image_path.replace('.JPG', '.jpg')
+            if alt_path == image_path:
+                alt_path = image_path.replace('.jpg', '.JPG')
+            image_path = alt_path if os.path.exists(alt_path) else image_path
+        image = Image.open(image_path)
 
         #if intr.model=="SIMPLE_RADIAL":
         #    image = cv2.undistort(np.array(image), K, np.array([intr.params[3], 0,0,0]))
@@ -226,11 +231,21 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
+        fovx = contents.get("camera_angle_x")
+        if fovx is None:
+            if "fl_x" in contents and "w" in contents:
+                fovx = 2 * np.arctan(contents["w"] / (2 * contents["fl_x"]))
+            else:
+                raise KeyError("camera_angle_x missing and no fl_x/w to compute it.")
 
         frames = contents["frames"]
+        if frames and Path(frames[0]["file_path"]).suffix:
+            extension = ""
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
+            if not os.path.exists(cam_name):
+                alt_name = os.path.join(path, frame["file_path"])
+                cam_name = alt_name if os.path.exists(alt_name) else cam_name
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
@@ -260,13 +275,13 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 dist = np.array([frame["k1"], frame["k2"], frame["p1"], frame["p2"], frame.get("k3", 0.0)], dtype=np.float32)
                 im_data = np.array(image.convert("RGB"))
                 arr = cv2.undistort(im_data / 255.0, mtx, dist, None, mtx)
-                image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+                image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
             else:
                 im_data = np.array(image.convert("RGBA"))
                 bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
                 norm_data = im_data / 255.0
                 arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-                image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+                image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
             fo = fov2focal(fovx, image.size[0])
 
             W,H = image.size[0], image.size[1]
@@ -282,6 +297,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             normal_arr = None
             normal_image_path = os.path.join(path, "normal", image_name + "_normal.png")
+            if not os.path.exists(normal_image_path):
+                normal_image_path = os.path.join(path, "normals", image_name + ".png")
             if os.path.exists(normal_image_path):
                 normal_image = Image.open(normal_image_path)
                 normal_im_data = np.array(normal_image.convert("RGBA"))

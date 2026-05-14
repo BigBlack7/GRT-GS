@@ -55,7 +55,7 @@ You may need to modify the path in `train.sh`
 
 ### Evaluation
 ```
-python eval.py --white_background --save_images --model_path output/NAME_OF_THE_SCENE
+python eval.py --white_background --save_images --model_path output/NAME_OF_THE_SCENE --eval_indirect
 ```
 You will get PSNR/SSIM/LPIPS/FPS results.
 

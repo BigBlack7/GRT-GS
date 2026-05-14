@@ -142,6 +142,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         # Set render
+        opt.enable_idiv = dataset.use_idiv and iteration >= opt.idiv_from_iter
         render = select_render_method(iteration, opt, initial_stage)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, srgb=opt.srgb, opt=opt)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -297,11 +298,15 @@ def set_gaussian_para(gaussians, opt, vol=False):
     gaussians.rough_msk_thr = opt.rough_msk_thr 
     gaussians.init_roughness_value = opt.init_roughness_value
     gaussians.init_refl_value = opt.init_refl_value
+    gaussians.init_metalness_value = opt.init_metalness_value
     gaussians.refl_msk_thr = opt.refl_msk_thr
+    gaussians.metal_msk_thr = opt.metal_msk_thr
 
 def reset_gaussian_para(gaussians, opt):
     gaussians.reset_ori_color()
+    gaussians.reset_diffuse_color()
     gaussians.reset_refl_strength(opt.init_refl_value)
+    gaussians.reset_metalness(opt.init_metalness_value)
     gaussians.reset_roughness(opt.init_roughness_value)
     gaussians.refl_msk_thr = opt.refl_msk_thr
     gaussians.rough_msk_thr = opt.rough_msk_thr
@@ -503,7 +508,10 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--gpu", type=str, default="-1")
     args = parser.parse_args(sys.argv[1:])
+    if args.gpu != "-1":
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     args.save_iterations.append(args.iterations)
     args.test_iterations = args.test_iterations + [i for i in range(10000, args.iterations+1, 5000)]
     args.test_iterations.append(args.volume_render_until_iter)

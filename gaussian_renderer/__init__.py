@@ -22,6 +22,21 @@ from utils.graphics_utils import linear_to_srgb, srgb_to_linear, rotation_betwee
 import numpy as np
 
 
+def _normal_from_gbuffer(render_normal):
+    return F.normalize(render_normal, dim=0, eps=1e-6)
+
+
+def _deferred_idiv_diffuse(albedo, metalness, render_normal, idiv_map):
+    normal_map = _normal_from_gbuffer(render_normal)
+    idiv_dot = (normal_map * idiv_map).sum(dim=0, keepdim=True).clamp_min(0.0)
+    diffuse = (1.0 - metalness).clamp(0.0, 1.0) * albedo * idiv_dot
+    return diffuse, normal_map, idiv_dot
+
+
+def _material_gate(metalness, refl_strength):
+    return torch.maximum(metalness, refl_strength).clamp(0.0, 1.0)
+
+
 
 def compute_2dgs_normal_and_regularizations(allmap, viewpoint_camera, pipe):
     # 2DGS normal and regularizations
@@ -224,7 +239,8 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     ## reflection strength 定义（即refl ratio）
     refl = pc.get_refl
-    ori_color = pc.get_ori_color
+    albedo = pc.get_diffuse_color
+    metalness = pc.get_metalness
     roughness = pc.get_rough
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -297,9 +313,10 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     
 
     idiv = None
-    if pc.use_idiv:
+    enable_idiv = pc.use_idiv and getattr(opt, "enable_idiv", True)
+    if enable_idiv:
         idiv = pc.get_idiv()
-    features = torch.cat((refl, roughness, ori_color, indirect), dim=-1)
+    features = torch.cat((refl, metalness, roughness, albedo, indirect), dim=-1)
     if idiv is not None:
         features = torch.cat((features, idiv), dim=-1)
     contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
@@ -317,12 +334,14 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     base_color = rendered_image
     refl_strength = rendered_features[:1]
-    roughness = rendered_features[1:2]
-    albedo = rendered_features[2:5]
-    indirect_light = rendered_features[5:8]
+    metalness_map = rendered_features[1:2]
+    material_gate = _material_gate(metalness_map, refl_strength)
+    roughness = rendered_features[2:3]
+    albedo = rendered_features[3:6]
+    indirect_light = rendered_features[6:9]
     idiv_map = None
     if idiv is not None:
-        idiv_map = rendered_features[8:11]
+        idiv_map = rendered_features[9:12]
 
 
     # 2DGS normal and regularizations
@@ -335,21 +354,20 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
 
     # Use normal map computed in 2DGS pipeline to perform reflection query
-    normal_map = render_normal.permute(1,2,0)
-    normal_map = normal_map / render_alpha.permute(1,2,0).clamp_min(1e-6)
+    normal_map_chw = _normal_from_gbuffer(render_normal)
+    normal_map = normal_map_chw.permute(1,2,0)
     
     if opt.indirect:
-        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth, indirect_light=indirect_light.permute(1,2,0))
+        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=material_gate.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth, indirect_light=indirect_light.permute(1,2,0))
     else:
-        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth)
+        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=material_gate.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth)
 
     # Integrate the final image
+    diffuse_color = (1.0 - material_gate).clamp(0.0, 1.0) * base_color
     if idiv_map is not None:
-        idiv_val = idiv_map.permute(1, 2, 0)
-        idiv_dot = (normal_map * idiv_val).sum(dim=-1, keepdim=True).clamp_min(0.0)
-        idiv_dot = idiv_dot.permute(2, 0, 1)
+        diffuse_color, normal_map_chw, idiv_dot = _deferred_idiv_diffuse(albedo, material_gate, render_normal, idiv_map)
         base_color = albedo * idiv_dot
-    final_image = (1-refl_strength) * base_color + specular 
+    final_image = diffuse_color + specular 
     
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
     if srgb: 
@@ -360,7 +378,7 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     final_image = final_image + bg_color[:, None, None] * (1 - render_alpha)
     if opt.indirect:
-        indirect_color = (1-refl_strength) * base_color + extra_dict['indirect_color']
+        indirect_color = diffuse_color + extra_dict['indirect_color']
         indirect_color = indirect_color + bg_color[:, None, None] * (1 - render_alpha)
         extra_dict['indirect_color'] = indirect_color
 
@@ -368,7 +386,8 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     # They will be excluded from value updates used in the splitting criteria.
     results =  {"render": final_image,
             "refl_strength_map": refl_strength,
-            "diffuse_map": (1-refl_strength) * base_color,
+            "metalness_map": metalness_map,
+            "diffuse_map": diffuse_color,
             "specular_map": specular,
             "base_color_map": albedo,
             "roughness_map": roughness,
@@ -438,7 +457,8 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     opacity = pc.get_opacity
 
     refl = pc.get_refl
-    ori_color = pc.get_ori_color
+    albedo = pc.get_diffuse_color
+    metalness = pc.get_metalness
     roughness = pc.get_rough
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -512,22 +532,25 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
 
     if opt.indirect:
-        diffuse, specular, extra = get_full_color_volume_indirect(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness, pc=pc, indirect_light=indirect)
+        material_gate = _material_gate(metalness, refl)
+        diffuse, specular, extra = get_full_color_volume_indirect(pc.get_envmap_2, means3D, albedo, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=material_gate, roughness=roughness, pc=pc, indirect_light=indirect)
         visibility = extra['visibility']
         direct_light = extra["direct_light"]
     else: 
-        diffuse, specular = get_full_color_volume(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness)
+        material_gate = _material_gate(metalness, refl)
+        diffuse, specular = get_full_color_volume(pc.get_envmap_2, means3D, albedo, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=material_gate, roughness=roughness)
     colors_precomp = specular + diffuse
 
 
 
 
     if opt.indirect:
-        features = torch.cat((roughness, refl, diffuse, specular, ori_color, visibility, indirect, direct_light), dim=-1)
+        features = torch.cat((roughness, refl, metalness, diffuse, specular, albedo, visibility, indirect, direct_light), dim=-1)
     else:
-        features = torch.cat((roughness, refl, diffuse, specular, ori_color), dim=-1)
+        features = torch.cat((roughness, refl, metalness, diffuse, specular, albedo), dim=-1)
     idiv = None
-    if pc.use_idiv:
+    enable_idiv = pc.use_idiv and getattr(opt, "enable_idiv", True)
+    if enable_idiv:
         idiv = pc.get_idiv()
         if idiv is not None:
             features = torch.cat((features, idiv), dim=-1)
@@ -549,18 +572,20 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     full_color = rendered_image     # (3,H,W)
     render_roughness = rendered_features[:1]   # (1,H,W)
     render_refl_strength = rendered_features[1:2]   # (1,H,W)
-    render_diffuse_color = rendered_features[2:5]
-    render_specular_color = rendered_features[5:8]
-    render_ori_color = rendered_features[8:11]
+    render_metalness = rendered_features[2:3]
+    render_material_gate = _material_gate(render_metalness, render_refl_strength)
+    render_diffuse_color = rendered_features[3:6]
+    render_specular_color = rendered_features[6:9]
+    render_albedo = rendered_features[9:12]
     idiv_map = None
     if opt.indirect:
-        render_visibility = rendered_features[11:12]
-        render_indirect = rendered_features[12:15] 
-        render_direct = rendered_features[15:18]
+        render_visibility = rendered_features[12:13]
+        render_indirect = rendered_features[13:16] 
+        render_direct = rendered_features[16:19]
         if idiv is not None:
-            idiv_map = rendered_features[18:21]
+            idiv_map = rendered_features[19:22]
     elif idiv is not None:
-        idiv_map = rendered_features[11:14]
+        idiv_map = rendered_features[12:15]
 
 
 
@@ -577,11 +602,8 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
 
     if idiv_map is not None:
-        normal_map = render_normal / render_alpha.clamp_min(1e-6)
-        idiv_val = idiv_map / render_alpha.clamp_min(1e-6)
-        idiv_dot = (normal_map * idiv_val).sum(dim=0, keepdim=True).clamp_min(0.0)
-        render_diffuse_color = render_ori_color * idiv_dot
-        full_color = (1 - render_refl_strength) * render_diffuse_color + render_specular_color
+        render_diffuse_color, _, _ = _deferred_idiv_diffuse(render_albedo, render_material_gate, render_normal, idiv_map)
+        full_color = render_diffuse_color + render_specular_color
 
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
     if srgb: 
@@ -598,9 +620,10 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     # They will be excluded from value updates used in the splitting criteria.
     results =  {"render": final_image,
             "refl_strength_map": render_refl_strength,
+            "metalness_map": render_metalness,
             "diffuse_map": render_diffuse_color,
             "specular_map": render_specular_color,
-            "base_color_map": render_ori_color,
+            "base_color_map": render_albedo,
             "roughness_map": render_roughness,
             "viewspace_points": means2D,
             "visibility_filter" : radii > 0,

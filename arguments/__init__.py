@@ -25,18 +25,29 @@ class ParamGroup:
             if key.startswith("_"):
                 shorthand = True
                 key = key[1:]
-            t = type(value)
-            value = value if not fill_none else None 
+            default_value = value
+            t = type(default_value)
+            value = default_value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    if default_value is True:
+                        group.add_argument("--" + key, ("-" + key[0:1]), dest=key, action="store_true")
+                        group.add_argument("--no_" + key, dest=key, action="store_false")
+                        group.set_defaults(**{key: value})
+                    else:
+                        group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
                 elif t == list: # #
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, nargs="+")
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    if default_value is True:
+                        group.add_argument("--" + key, dest=key, action="store_true")
+                        group.add_argument("--no_" + key, dest=key, action="store_false")
+                        group.set_defaults(**{key: value})
+                    else:
+                        group.add_argument("--" + key, default=value, action="store_true")
                 elif t == list: # #
                     group.add_argument("--" + key, default=value, nargs="+")
                 else:
@@ -71,6 +82,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.lod = 0
+        self.llffhold = 8
         self.undistorted = False
 
         # EnvLight Settings
@@ -88,7 +100,7 @@ class ModelParams(ParamGroup):
 
 
 class PipelineParams(ParamGroup):
-    def __init__(self, parser):
+    def __init__(self, parser, sentinel=False):
         # Processing Settings
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
@@ -98,11 +110,11 @@ class PipelineParams(ParamGroup):
         self.depth_ratio = 0.0
         self.debug = False
 
-        super().__init__(parser, "Pipeline Parameters")
+        super().__init__(parser, "Pipeline Parameters", sentinel)
 
 
 class OptimizationParams(ParamGroup):
-    def __init__(self, parser):
+    def __init__(self, parser, sentinel=False):
         # Learning Rate Settings
         self.iterations = 50_000
         self.position_lr_init = 0.00016
@@ -137,7 +149,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_normal_render_depth = 0.05
         self.lambda_normal_smooth = 0.0
         self.lambda_depth_smooth = 0.0
-        self.lambda_idiv = 0.0
+        self.lambda_idiv = 0.005
 
 
         # initial values
@@ -147,6 +159,8 @@ class OptimizationParams(ParamGroup):
         self.rough_msk_thr = 0.01
         self.refl_msk_thr = 0.02
         self.refl_msk_thr_vol = 0.02
+        self.init_metalness_value = 0.05
+        self.metal_msk_thr = 0.5
 
         self.enlarge_scale = 1.5
 
@@ -169,6 +183,7 @@ class OptimizationParams(ParamGroup):
         self.volume_render_until_iter = 18000 
         self.normal_smooth_from_iter = 0
         self.normal_smooth_until_iter = 18000
+        self.idiv_from_iter = 3000
                 
         self.indirect = 0
         self.indirect_from_iter =  20000 
@@ -201,7 +216,7 @@ class OptimizationParams(ParamGroup):
         self.num_cluster = 1
 
 
-        super().__init__(parser, "Optimization Parameters")
+        super().__init__(parser, "Optimization Parameters", sentinel)
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]

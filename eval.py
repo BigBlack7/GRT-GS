@@ -1,6 +1,7 @@
 import torch
+import torch.nn.functional as F
 from scene import Scene
-import os, time
+import os, time, json
 import numpy as np
 from tqdm import tqdm
 from os import makedirs
@@ -28,6 +29,7 @@ def render_set(model_path, views, gaussians, pipeline, background, save_ims, opt
     ssims = []
     psnrs = []
     lpipss = []
+    normal_maes = []
     render_times = []
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -46,6 +48,13 @@ def render_set(model_path, views, gaussians, pipeline, background, save_ims, opt
         psnrs.append(psnr(render_color, gt).item())
         lpipss.append(lpips(render_color, gt, net_type='vgg').item())
         render_times.append(render_time)
+        if getattr(view, "gt_normal", None) is not None and 'rend_normal' in rendering:
+            pred_normal = F.normalize(rendering['rend_normal'], dim=0, eps=1e-6)
+            gt_normal = F.normalize(view.gt_normal.to(pred_normal.device), dim=0, eps=1e-6)
+            cos = (pred_normal * gt_normal).sum(dim=0).clamp(-1.0, 1.0)
+            normal_err = torch.rad2deg(torch.acos(cos))
+            alpha_mask = rendering.get('rend_alpha', torch.ones_like(normal_err[None]))[0] > 0.5
+            normal_maes.append(normal_err[alpha_mask].mean().item() if alpha_mask.any() else normal_err.mean().item())
 
         if save_ims:
             # Save the rendered color image
@@ -59,10 +68,15 @@ def render_set(model_path, views, gaussians, pipeline, background, save_ims, opt
     psnr_v = np.array(psnrs).mean()
     lpip_v = np.array(lpipss).mean()
     fps = 1.0 / np.array(render_times).mean()
-    print('psnr:{}, ssim:{}, lpips:{}, fps:{}'.format(psnr_v, ssim_v, lpip_v, fps))
+    metrics = {'psnr': float(psnr_v), 'ssim': float(ssim_v), 'lpips': float(lpip_v), 'fps': float(fps)}
+    if normal_maes:
+        metrics['normal_mae'] = float(np.array(normal_maes).mean())
+    print(', '.join(f'{k}:{v}' for k, v in metrics.items()))
     dump_path = os.path.join(model_path, 'metric.txt')
     with open(dump_path, 'w') as f:
-        f.write('psnr:{}, ssim:{}, lpips:{}, fps:{}'.format(psnr_v, ssim_v, lpip_v, fps))
+        f.write(', '.join(f'{k}:{v}' for k, v in metrics.items()))
+    with open(os.path.join(model_path, 'results.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
 
 def render_set_train(model_path, views, gaussians, pipeline, background, save_ims, opt):
     if save_ims:
@@ -112,9 +126,21 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         iteration = searchForMaxIteration(os.path.join(dataset.model_path, "point_cloud"))
-        if indirect:
+        op.enable_idiv = dataset.use_idiv and iteration >= op.idiv_from_iter
+        mesh_path = os.path.join(dataset.model_path, f'test_{iteration:06d}.ply')
+        use_indirect = (iteration >= op.indirect_from_iter and os.path.exists(mesh_path)) if indirect is None else indirect
+        if use_indirect:
             op.indirect = 1
             gaussians.load_mesh_from_ply(dataset.model_path, iteration)
+        else:
+            op.indirect = 0
+        print(
+            "Loaded eval state: "
+            f"iteration={iteration}, "
+            f"enable_idiv={op.enable_idiv}, "
+            f"indirect={op.indirect}, "
+            f"mesh_exists={os.path.exists(mesh_path)}"
+        )
 
         
         # render_set_train(dataset.model_path, scene.getTrainCameras(), gaussians, pipeline, background, save_ims, op)
@@ -137,15 +163,31 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
-    op = OptimizationParams(parser)
-    pipeline = PipelineParams(parser)
+    op = OptimizationParams(parser, sentinel=True)
+    pipeline = PipelineParams(parser, sentinel=True)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--save_images", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--gpu", type=str, default="-1")
+    parser.add_argument("--eval_indirect", dest="eval_indirect", action="store_true", default=None)
+    parser.add_argument("--no_eval_indirect", dest="eval_indirect", action="store_false")
     args = get_combined_args(parser)
+    if args.gpu != "-1":
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.save_images, op, True)
+    dataset = model.extract(args)
+    opt = op.extract(args)
+    pipe = pipeline.extract(args)
+    print(
+        "Eval config: "
+        f"iteration={args.iteration}, "
+        f"use_idiv={dataset.use_idiv}, "
+        f"idiv_from_iter={opt.idiv_from_iter}, "
+        f"srgb={opt.srgb}, "
+        f"eval_indirect={args.eval_indirect}"
+    )
+    render_sets(dataset, args.iteration, pipe, args.save_images, opt, args.eval_indirect)

@@ -65,11 +65,20 @@ def loadCam(args, id, cam_info, resolution_scale):
         refl_msk = torch.tensor(refl_msk).permute(2,0,1).float()
     else: refl_msk = None
 
+    gt_normal = None
+    if cam_info.normal is not None:
+        normal = torch.from_numpy(cam_info.normal).float().permute(2, 0, 1)
+        gt_normal = torch.nn.functional.interpolate(
+            normal[None], size=(resolution[1], resolution[0]), mode="bilinear", align_corners=False)[0]
+        gt_normal = gt_normal * 2.0 - 1.0
+        gt_normal = torch.nn.functional.normalize(gt_normal, dim=0, eps=1e-6)
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, 
-                  data_device=args.data_device, HWK=HWK, gt_refl_mask=refl_msk)
+                  data_device=args.data_device, HWK=HWK, gt_refl_mask=refl_msk,
+                  gt_normal=gt_normal)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
