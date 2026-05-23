@@ -1,106 +1,108 @@
 # PhysNorm-GS
 
-PhysNorm-GS builds on Ref-Gaussian and adds a deferred, material-aware IDIV diffuse branch inspired by Normal-GS.
+PhysNorm-GS 是一个面向混合反射场景的 Gaussian inverse rendering 工程。当前实现以干净的 deferred PBR / 2D Gaussian 表面渲染链路为主体，并加入四个稳定性与泛化模块：
 
-## Unified Training
+- **R2IF**：可靠反射引导的照明因子分解。低反射或高粗糙区域会减弱高频环境贴图监督，避免 envmap 退化成彩色噪声。
+- **NCIF**：法向耦合辐照场。每个 Gaussian 维护一个零初始化的局部辐照方向残差，以有界调制方式补充漫反射区域的法向梯度。
+- **PCC**：阶段一致连续优化。默认使用软重置缓解 delayed rendering 阶段切换时的硬重置突降。
+- **CGI**：置信度门控互反射。mesh-based indirect 不再作为无差别强反馈，而是随反射/粗糙度可靠性渐进启用。
 
-All datasets now use the same entrypoint:
-
-```bash
-python train.py -s <DATASET_PATH> -m <OUTPUT_PATH> --eval --gpu 0
-```
-
-Ref-Gaussian style synthetic or real reflective scenes:
+## 安装
 
 ```bash
-python train.py -s data/ref_nerf/coffee -m output/coffee/physnorm --eval --white_background --gpu 0
-python eval.py -m output/coffee/physnorm --white_background --save_images --gpu 0
+conda create -n physnorm-gs python=3.8
+conda activate physnorm-gs
+
+pip install torch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0
+pip install submodules/cubemapencoder
+pip install submodules/diff-surfel-rasterization
+pip install submodules/simple-knn
+pip install submodules/raytracing
+pip install -r requirements.txt
 ```
 
-Mip-NeRF 360 / Tanks and Temples / Deep Blending style COLMAP scenes:
+## 基础训练
 
 ```bash
-python train.py -s data/mipnerf360/bonsai -m output/bonsai/physnorm --eval --lod 0 --llffhold 8 --gpu 0
-python eval.py -m output/bonsai/physnorm --save_images --gpu 0
+python train.py -s <DATASET> -m <OUT> --eval --white_background
 ```
 
-Blender/NeRF synthetic style scenes:
+关闭本文新增模块，验证主体渲染链路：
 
 ```bash
-python train.py -s data/nerf_synthetic/lego -m output/lego/physnorm --eval --white_background --gpu 0
-python eval.py -m output/lego/physnorm --white_background --save_images --gpu 0
+python train.py -s <DATASET> -m <OUT>/baseline --eval --white_background --no_use_ncif --no_use_r2if --no_use_pcc --no_use_cgi
 ```
 
-## Important Parameters
-
-Core method switches:
-
-- `--use_idiv` / `--no_use_idiv`: enable or disable the deferred IDIV branch.
-- `--idiv_from_iter`: first iteration where IDIV contributes to rendering and smoothing loss. Default: `3000`.
-- `--lambda_idiv`: edge-aware IDIV smoothness weight. Suggested range: `0.001` to `0.01`.
-- `--init_metalness_value`: initial metallic value for Gaussian material gating. Default: `0.05`.
-- `--metal_msk_thr`: metalness threshold used by material-aware normal propagation. Default: `0.5`.
-
-Geometry and normal:
-
-- `--lambda_normal_render_depth`: depth-normal consistency. Start with `0.05`.
-- `--lambda_normal_smooth`: image-edge-aware normal smoothness. Start with `0.2` to `1.0` on noisy geometry.
-- `--normal_prop_until_iter`: normal propagation/densification phase length.
-
-Training schedule:
-
-- `--iterations`: total iterations.
-- `--init_until_iter`: optional initial RGB/geometry stage.
-- `--volume_render_until_iter`: volume/deferred transition point.
-- `--indirect_from_iter`: enables mesh-based inter-reflection after enough geometry is formed.
-
-Dataset split:
-
-- `--eval`: keeps a test split.
-- `--lod`: Normal-GS compatible holdout behavior; `0` means LLFF-style holdout.
-- `--llffhold`: test every N-th COLMAP image when `--lod 0`. Default: `8`.
-
-## Gradual Tuning Guide
-
-1. Baseline check:
+启用完整 PhysNorm-GS：
 
 ```bash
-python train.py -s <DATASET> -m <OUT>/baseline --eval --no_use_idiv --gpu 0
+python train.py -s <DATASET> -m <OUT>/physnorm --eval --white_background --ncif_from_iter 3000 --ncif_tau 0.15 --ncif_ramp_iters 5000 --lambda_ncif_smooth 0.005 --lambda_ncif_magnitude 0.001
 ```
 
-This verifies the Ref-Gaussian path on the same codebase.
+## 关键参数
 
-2. Conservative PhysNorm-GS:
+- `--use_ncif` / `--no_use_ncif`：是否启用 NCIF。
+- `--ncif_from_iter`：NCIF 开始参与渲染和正则的迭代数。
+- `--ncif_tau`：NCIF 对 diffuse 的最大有界调制幅度。
+- `--ncif_ramp_iters`：NCIF 从 0 ramp 到 `ncif_tau` 的迭代长度。
+- `--ncif_lr`：per-Gaussian NCIF 向量学习率。
+- `--lambda_ncif_smooth`：NCIF map 的边缘感知平滑权重。
+- `--lambda_ncif_magnitude`：NCIF 幅值正则。
+- `--use_r2if` / `--no_use_r2if`：是否启用反射可靠性 specular gate。
+- `--r2if_specular_alpha`、`--r2if_specular_beta`：反射强度和粗糙度在 R2IF gate 中的指数。
+- `--r2if_min_specular_gate`：高频环境贴图 specular gate 的下界。
+- `--use_pcc` / `--no_use_pcc`：是否使用阶段切换软重置。
+- `--pcc_keep_ratio`：阶段切换时保留旧材质的比例。
+- `--use_cgi` / `--no_use_cgi`：是否启用置信度门控互反射。
+- `--cgi_ramp_iters`：indirect gate 的渐进启用长度。
+- `--lambda_env_tv`：环境贴图 TV 正则。
+- `--lambda_env_energy`：两个训练阶段环境贴图之间的能量一致性正则。
+
+## 阶段参数
+
+- `--volume_render_until_iter`：volume rendering 阶段结束迭代，默认 `18000`。
+- `--normal_prop_until_iter`：材质感知法线传播截止迭代，默认 `25000`。
+- `--indirect_from_iter`：mesh-based inter-reflection 启用迭代。几何不稳时建议延后到 `30000` 或更晚。
+- `--iterations`：总训练迭代数，默认 `50000`。
+
+## 数据集参数
+
+- Blender / NeRF Synthetic / Glossy Synthetic：通常使用 `--eval --white_background`，数据划分来自 `transforms_train.json` 和 `transforms_test.json`。
+- Ref-Real：通常使用官方短训初始化协议，不强制 `--white_background`。
+- COLMAP 数据：仍保留 `--lod` 与 `--llffhold` 作为数据划分参数；它们不是 NCIF/R2IF 方法参数。
+
+## 评估
 
 ```bash
-python train.py -s <DATASET> -m <OUT>/idiv_calm --eval --idiv_from_iter 5000 --lambda_idiv 0.002 --init_metalness_value 0.05 --gpu 0
+python eval.py -m <OUT>/physnorm --white_background --save_images
 ```
 
-Use this when early geometry is unstable.
-
-3. Stronger diffuse-normal coupling:
+强制使用已保存 mesh indirect：
 
 ```bash
-python train.py -s <DATASET> -m <OUT>/idiv_strong --eval --idiv_from_iter 2000 --lambda_idiv 0.005 --lambda_normal_render_depth 0.05 --gpu 0
+python eval.py -m <OUT>/physnorm --white_background --save_images --force_indirect
 ```
 
-Use this for mostly diffuse or mixed-material scenes.
-
-4. Reflective scenes:
+关闭 indirect 评估：
 
 ```bash
-python train.py -s <DATASET> -m <OUT>/reflective --eval --idiv_from_iter 5000 --lambda_idiv 0.001 --indirect_from_iter 20000 --gpu 0
+python eval.py -m <OUT>/physnorm --white_background --save_images --no_indirect
 ```
 
-Keep IDIV smoothness small so high-metal regions remain dominated by the PBR specular path.
+## 批量训练
 
-Evaluation writes `metric.txt` and `results.json` with PSNR, SSIM, LPIPS, FPS, and Normal MAE when GT normals are available under `normal/*_normal.png` or `normals/*.png`.
+`train.sh` 已按当前 proposal 更新为 NCIF/R2IF/PCC/CGI 参数。直接运行：
 
-==================================================反射=====================================================
+```bash
+sh train.sh
+```
 
-python train.py -s /data/zmh/Projects/data/blender/angel_blender -m /data2/zmh/output/GlossySynthetic/angel_idiv --eval --idiv_from_iter 8000 --lambda_idiv 0.0005 --indirect_from_iter 20000 --white_background
+路径需要根据本机数据集位置调整。
 
-python eval.py --white_background --save_images --model_path /data2/zmh/output/GlossySynthetic/angel_idiv --eval_indirect
+## 代码清理状态
 
-==================================================混合=====================================================
-python train.py -s <DATASET> -m <OUT>/idiv_strong --eval --idiv_from_iter 2000 --lambda_idiv 0.005 --lambda_normal_render_depth 0.05 --white_background
+- 已移除 anchor-based MLP 主路径。
+- 已移除 IIV 分支。
+- 旧 diffuse residual 训练参数已统一替换为 `ncif_*`。
+- 旧 indirect 评估开关已替换为更清晰的 `force_indirect/no_indirect`。
+- `lod/llffhold` 仅保留为 COLMAP 数据划分参数，不用于 synthetic / Ref-Real 训练命令。

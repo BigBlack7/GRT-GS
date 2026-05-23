@@ -22,19 +22,59 @@ from utils.graphics_utils import linear_to_srgb, srgb_to_linear, rotation_betwee
 import numpy as np
 
 
-def _normal_from_gbuffer(render_normal):
-    return F.normalize(render_normal, dim=0, eps=1e-6)
+def _material_gate(refl_strength, opt=None):
+    return refl_strength.clamp(0.0, 1.0)
 
 
-def _deferred_idiv_diffuse(albedo, metalness, render_normal, idiv_map):
-    normal_map = _normal_from_gbuffer(render_normal)
-    idiv_dot = (normal_map * idiv_map).sum(dim=0, keepdim=True).clamp_min(0.0)
-    diffuse = (1.0 - metalness).clamp(0.0, 1.0) * albedo * idiv_dot
-    return diffuse, normal_map, idiv_dot
+def _schedule_weight(opt, start_name, ramp_name, target):
+    if target <= 0.0:
+        return 0.0
+    current_iteration = float(getattr(opt, "current_iteration", getattr(opt, "iterations", 0)))
+    start = float(getattr(opt, start_name, 0))
+    ramp = max(float(getattr(opt, ramp_name, 1)), 1.0)
+    progress = max(0.0, min(1.0, (current_iteration - start) / ramp))
+    return target * progress
 
 
-def _material_gate(metalness, refl_strength):
-    return torch.maximum(metalness, refl_strength).clamp(0.0, 1.0)
+def _ncif_tau(opt):
+    return _schedule_weight(opt, "ncif_from_iter", "ncif_ramp_iters", float(getattr(opt, "ncif_tau", 0.0)))
+
+
+def _specular_reliability(refl_strength, roughness, opt=None):
+    if opt is not None and not getattr(opt, "use_r2if", True):
+        return torch.ones_like(refl_strength)
+    alpha = float(getattr(opt, "r2if_specular_alpha", 1.0)) if opt is not None else 1.0
+    beta = float(getattr(opt, "r2if_specular_beta", 1.0)) if opt is not None else 1.0
+    min_gate = float(getattr(opt, "r2if_min_specular_gate", 0.0)) if opt is not None else 0.0
+    gate = refl_strength.clamp(0.0, 1.0).pow(alpha) * (1.0 - roughness.clamp(0.0, 1.0)).pow(beta)
+    if min_gate > 0.0:
+        gate = min_gate + (1.0 - min_gate) * gate
+    return gate.clamp(0.0, 1.0)
+
+
+def _cgi_gate(refl_strength, roughness, opt=None):
+    if opt is not None and not getattr(opt, "use_cgi", True):
+        return torch.ones_like(refl_strength)
+    target = _specular_reliability(refl_strength, roughness, opt)
+    ramp = _schedule_weight(opt, "indirect_from_iter", "cgi_ramp_iters", 1.0)
+    return (target * ramp).clamp(0.0, 1.0)
+
+
+def _diffuse_responsibility(refl_strength, roughness, opt=None):
+    mu = float(getattr(opt, "ncif_diffuse_mu", 1.0)) if opt is not None else 1.0
+    nu = float(getattr(opt, "ncif_diffuse_nu", 1.0)) if opt is not None else 1.0
+    return (1.0 - refl_strength.clamp(0.0, 1.0)).pow(mu) * roughness.clamp(0.0, 1.0).pow(nu)
+
+
+def _apply_ncif_diffuse(ref_diffuse, normal_map, ncif_map, refl_strength, roughness, opt=None):
+    tau = _ncif_tau(opt)
+    if tau <= 0.0:
+        return ref_diffuse, None, None
+    raw = (normal_map * ncif_map).sum(dim=0, keepdim=True)
+    responsibility = _diffuse_responsibility(refl_strength, roughness, opt)
+    response = tau * responsibility * torch.tanh(raw)
+    diffuse = torch.clamp_min(ref_diffuse * (1.0 + response), 0.0)
+    return diffuse, response, responsibility
 
 
 
@@ -239,8 +279,7 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     ## reflection strength 定义（即refl ratio）
     refl = pc.get_refl
-    albedo = pc.get_diffuse_color
-    metalness = pc.get_metalness
+    ori_color = pc.get_ori_color
     roughness = pc.get_rough
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -289,7 +328,6 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     normals = pc.get_normal(scaling_modifier, dir_pp_normalized)
     w_o = -dir_pp_normalized
     reflection = 2 * torch.sum(normals * w_o, dim=1, keepdim=True) * normals - w_o
-    reflection = F.normalize(reflection, dim=-1)
     if pipe.use_asg:
         rotation_normal = rotation_between_z(normals).transpose(-1, -2)
         reflection_cartesian = (rotation_normal @ reflection[..., None])[..., 0]
@@ -307,18 +345,14 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         shs_indirect = pc.get_indirect.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
         sh2indirect = eval_sh(3, shs_indirect, reflection)
         indirect = torch.clamp_min(sh2indirect, 0.0)
-    if pc.use_iiv and pc.mlp_iiv is not None:
-        iiv = pc.get_iiv(reflection, normals)
-        indirect = torch.clamp_min(iiv, 0.0)
-    
 
-    idiv = None
-    enable_idiv = pc.use_idiv and getattr(opt, "enable_idiv", True)
-    if enable_idiv:
-        idiv = pc.get_idiv()
-    features = torch.cat((refl, metalness, roughness, albedo, indirect), dim=-1)
-    if idiv is not None:
-        features = torch.cat((features, idiv), dim=-1)
+    ncif_dir = None
+    enable_ncif = pc.use_ncif and getattr(opt, "enable_ncif", True)
+    if enable_ncif:
+        ncif_dir = pc.get_ncif_dir()
+    features = torch.cat((refl, roughness, ori_color, indirect), dim=-1)
+    if ncif_dir is not None:
+        features = torch.cat((features, ncif_dir), dim=-1)
     contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -334,14 +368,13 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     base_color = rendered_image
     refl_strength = rendered_features[:1]
-    metalness_map = rendered_features[1:2]
-    material_gate = _material_gate(metalness_map, refl_strength)
-    roughness = rendered_features[2:3]
-    albedo = rendered_features[3:6]
-    indirect_light = rendered_features[6:9]
-    idiv_map = None
-    if idiv is not None:
-        idiv_map = rendered_features[9:12]
+    material_gate = _material_gate(refl_strength, opt)
+    roughness = rendered_features[1:2]
+    albedo = rendered_features[2:5]
+    indirect_light = rendered_features[5:8]
+    ncif_map = None
+    if ncif_dir is not None:
+        ncif_map = rendered_features[8:11]
 
 
     # 2DGS normal and regularizations
@@ -354,19 +387,24 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
 
     # Use normal map computed in 2DGS pipeline to perform reflection query
-    normal_map_chw = _normal_from_gbuffer(render_normal)
-    normal_map = normal_map_chw.permute(1,2,0)
+    normal_map = render_normal.permute(1,2,0)
+    normal_map = normal_map / render_alpha.permute(1,2,0).clamp_min(1e-6)
+    normal_map_chw = F.normalize(normal_map.permute(2,0,1), dim=0, eps=1e-6)
     
     if opt.indirect:
-        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=material_gate.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth, indirect_light=indirect_light.permute(1,2,0))
+        indirect_gate = _cgi_gate(refl_strength, roughness, opt)
+        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth, indirect_light=indirect_light.permute(1,2,0), indirect_gate=indirect_gate.permute(1,2,0))
     else:
-        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=material_gate.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth)
+        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth)
+    specular_reliability = _specular_reliability(refl_strength, roughness, opt)
+    specular = specular * specular_reliability
 
     # Integrate the final image
     diffuse_color = (1.0 - material_gate).clamp(0.0, 1.0) * base_color
-    if idiv_map is not None:
-        diffuse_color, normal_map_chw, idiv_dot = _deferred_idiv_diffuse(albedo, material_gate, render_normal, idiv_map)
-        base_color = albedo * idiv_dot
+    ncif_response = None
+    ncif_responsibility = None
+    if ncif_map is not None:
+        diffuse_color, ncif_response, ncif_responsibility = _apply_ncif_diffuse(diffuse_color, normal_map_chw, ncif_map, refl_strength, roughness, opt)
     final_image = diffuse_color + specular 
     
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
@@ -386,7 +424,6 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     # They will be excluded from value updates used in the splitting criteria.
     results =  {"render": final_image,
             "refl_strength_map": refl_strength,
-            "metalness_map": metalness_map,
             "diffuse_map": diffuse_color,
             "specular_map": specular,
             "base_color_map": albedo,
@@ -402,8 +439,11 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
             'surf_normal': surf_normal
     }
     
-    if idiv_map is not None:
-        results.update({"idiv_map": idiv_map})
+    results.update({"specular_reliability": specular_reliability})
+    if ncif_map is not None:
+        results.update({"ncif_map": ncif_map})
+        if ncif_response is not None:
+            results.update({"ncif_response": ncif_response, "ncif_responsibility": ncif_responsibility})
     if opt.indirect:
         results.update(extra_dict)
 
@@ -457,8 +497,7 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     opacity = pc.get_opacity
 
     refl = pc.get_refl
-    albedo = pc.get_diffuse_color
-    metalness = pc.get_metalness
+    ori_color = pc.get_ori_color
     roughness = pc.get_rough
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -525,35 +564,31 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         shs_indirect = pc.get_indirect.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
         sh2indirect = eval_sh(3, shs_indirect, reflection)
         indirect = torch.clamp_min(sh2indirect, 0.0)
-    reflection = F.normalize(reflection, dim=-1)
-    if pc.use_iiv and pc.mlp_iiv is not None:
-        iiv = pc.get_iiv(reflection, normals)
-        indirect = torch.clamp_min(iiv, 0.0)
-
-
     if opt.indirect:
-        material_gate = _material_gate(metalness, refl)
-        diffuse, specular, extra = get_full_color_volume_indirect(pc.get_envmap_2, means3D, albedo, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=material_gate, roughness=roughness, pc=pc, indirect_light=indirect)
+        material_gate = _material_gate(refl, opt)
+        indirect_gate = _cgi_gate(refl, roughness, opt)
+        diffuse, specular, extra = get_full_color_volume_indirect(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness, pc=pc, indirect_light=indirect, indirect_gate=indirect_gate)
         visibility = extra['visibility']
         direct_light = extra["direct_light"]
     else: 
-        material_gate = _material_gate(metalness, refl)
-        diffuse, specular = get_full_color_volume(pc.get_envmap_2, means3D, albedo, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=material_gate, roughness=roughness)
+        material_gate = _material_gate(refl, opt)
+        diffuse, specular = get_full_color_volume(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness)
+    specular = specular * _specular_reliability(refl, roughness, opt)
     colors_precomp = specular + diffuse
 
 
 
 
     if opt.indirect:
-        features = torch.cat((roughness, refl, metalness, diffuse, specular, albedo, visibility, indirect, direct_light), dim=-1)
+        features = torch.cat((roughness, refl, diffuse, specular, ori_color, visibility, indirect, direct_light), dim=-1)
     else:
-        features = torch.cat((roughness, refl, metalness, diffuse, specular, albedo), dim=-1)
-    idiv = None
-    enable_idiv = pc.use_idiv and getattr(opt, "enable_idiv", True)
-    if enable_idiv:
-        idiv = pc.get_idiv()
-        if idiv is not None:
-            features = torch.cat((features, idiv), dim=-1)
+        features = torch.cat((roughness, refl, diffuse, specular, ori_color), dim=-1)
+    ncif_dir = None
+    enable_ncif = pc.use_ncif and getattr(opt, "enable_ncif", True)
+    if enable_ncif:
+        ncif_dir = pc.get_ncif_dir()
+        if ncif_dir is not None:
+            features = torch.cat((features, ncif_dir), dim=-1)
 
     contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
         means3D = means3D,
@@ -572,20 +607,19 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     full_color = rendered_image     # (3,H,W)
     render_roughness = rendered_features[:1]   # (1,H,W)
     render_refl_strength = rendered_features[1:2]   # (1,H,W)
-    render_metalness = rendered_features[2:3]
-    render_material_gate = _material_gate(render_metalness, render_refl_strength)
-    render_diffuse_color = rendered_features[3:6]
-    render_specular_color = rendered_features[6:9]
-    render_albedo = rendered_features[9:12]
-    idiv_map = None
+    render_material_gate = _material_gate(render_refl_strength, opt)
+    render_diffuse_color = rendered_features[2:5]
+    render_specular_color = rendered_features[5:8]
+    render_ori_color = rendered_features[8:11]
+    ncif_map = None
     if opt.indirect:
-        render_visibility = rendered_features[12:13]
-        render_indirect = rendered_features[13:16] 
-        render_direct = rendered_features[16:19]
-        if idiv is not None:
-            idiv_map = rendered_features[19:22]
-    elif idiv is not None:
-        idiv_map = rendered_features[12:15]
+        render_visibility = rendered_features[11:12]
+        render_indirect = rendered_features[12:15] 
+        render_direct = rendered_features[15:18]
+        if ncif_dir is not None:
+            ncif_map = rendered_features[18:21]
+    elif ncif_dir is not None:
+        ncif_map = rendered_features[11:14]
 
 
 
@@ -601,8 +635,12 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
 
 
-    if idiv_map is not None:
-        render_diffuse_color, _, _ = _deferred_idiv_diffuse(render_albedo, render_material_gate, render_normal, idiv_map)
+    ncif_response = None
+    ncif_responsibility = None
+    if ncif_map is not None:
+        normal_map = render_normal / render_alpha.clamp_min(1e-6)
+        normal_map = F.normalize(normal_map, dim=0, eps=1e-6)
+        render_diffuse_color, ncif_response, ncif_responsibility = _apply_ncif_diffuse(render_diffuse_color, normal_map, ncif_map, render_refl_strength, render_roughness, opt)
         full_color = render_diffuse_color + render_specular_color
 
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
@@ -620,10 +658,9 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     # They will be excluded from value updates used in the splitting criteria.
     results =  {"render": final_image,
             "refl_strength_map": render_refl_strength,
-            "metalness_map": render_metalness,
             "diffuse_map": render_diffuse_color,
             "specular_map": render_specular_color,
-            "base_color_map": render_albedo,
+            "base_color_map": render_ori_color,
             "roughness_map": render_roughness,
             "viewspace_points": means2D,
             "visibility_filter" : radii > 0,
@@ -639,8 +676,11 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     if delta_normal_norm is not None:
         results.update({"delta_normal_norm": delta_normal_norm.repeat(3,1,1)})
 
-    if idiv_map is not None:
-        results.update({"idiv_map": idiv_map})
+    results.update({"specular_reliability": _specular_reliability(render_refl_strength, render_roughness, opt)})
+    if ncif_map is not None:
+        results.update({"ncif_map": ncif_map})
+        if ncif_response is not None:
+            results.update({"ncif_response": ncif_response, "ncif_responsibility": ncif_responsibility})
     if opt.indirect:
         results.update(
             {

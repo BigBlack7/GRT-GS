@@ -77,15 +77,10 @@ class GaussianModel:
         self.asg_param = init_predefined_omega(4, 8)
 
 
-    def __init__(self, sh_degree : int, anchor_feat_dim: int = 32, idiv_hidden_dim: int = 64, iiv_hidden_dim: int = 64,
-                 use_idiv: bool = True, use_iiv: bool = False):
+    def __init__(self, sh_degree : int, use_ncif: bool = True):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
-        self.anchor_feat_dim = anchor_feat_dim
-        self.idiv_hidden_dim = idiv_hidden_dim
-        self.iiv_hidden_dim = iiv_hidden_dim
-        self.use_idiv = use_idiv
-        self.use_iiv = use_iiv
+        self.use_ncif = use_ncif
         self._xyz = torch.empty(0)
         self._refl_strength = torch.empty(0) 
         self._ori_color = torch.empty(0) 
@@ -106,9 +101,7 @@ class GaussianModel:
 
         self._normal1 = torch.empty(0)
         self._normal2 = torch.empty(0)
-        self._anchor_feat = torch.empty(0)
-        self.mlp_idiv = None
-        self.mlp_iiv = None
+        self._ncif_dir = torch.empty(0)
 
         self.optimizer = None
         self.free_radius = 0    
@@ -116,11 +109,10 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.init_refl_value = 0.01
         self.init_roughness_value = 0.1 #[0,1]
-        self.init_metalness_value = 0.05 #[0,1]
+        self.init_metalness_value = 0.5 #[0,1]
         self.init_ori_color = 0  
         self.enlarge_scale = 1.5
         self.refl_msk_thr = 0.02
-        self.metal_msk_thr = 0.5
         self.rough_msk_thr = 0.1
 
         self.env_map = None
@@ -130,27 +122,6 @@ class GaussianModel:
         self.env_directions2 = get_env_direction2(self.env_H, self.env_W)
         self.ray_tracer = None
         self.setup_functions()
-        if self.use_idiv:
-            self.mlp_idiv = self._build_idiv_mlp()
-        if self.use_iiv:
-            self.mlp_iiv = self._build_iiv_mlp()
-
-    def _build_idiv_mlp(self):
-        mlp = nn.Sequential(
-            nn.Linear(self.anchor_feat_dim, self.idiv_hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(self.idiv_hidden_dim, 3),
-        ).cuda()
-        torch.nn.init.constant_(mlp[-1].bias, 1.0)
-        return mlp
-
-    def _build_iiv_mlp(self):
-        return nn.Sequential(
-            nn.Linear(self.anchor_feat_dim + 6, self.iiv_hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(self.iiv_hidden_dim, 3),
-            nn.Softplus(),
-        ).cuda()
 
     def capture(self):
         return (
@@ -176,13 +147,37 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
-            self._anchor_feat,
-            self.mlp_idiv.state_dict() if self.mlp_idiv is not None else None,
-            self.mlp_iiv.state_dict() if self.mlp_iiv is not None else None,
+            self._ncif_dir,
         )
     
     def restore(self, model_args, training_args):
-        if len(model_args) >= 25:
+        if len(model_args) > 0 and model_args[0] == "physnorm_no_metal_v1":
+            (_version,
+            self.active_sh_degree,
+            self._xyz,
+            self._refl_strength,
+            self._roughness,
+            self._ori_color,
+            self._diffuse_color,
+            self._features_dc,
+            self._features_rest,
+            self._indirect_dc,
+            self._indirect_rest,
+            self._indirect_asg,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal1,
+            self._normal2,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._ncif_dir) = model_args
+            metalness = torch.ones_like(self._refl_strength, device="cuda") * self.init_metalness_value
+            self._metalness = nn.Parameter(self.inverse_metalness_activation(metalness).requires_grad_(True))
+        elif len(model_args) >= 26:
             (self.active_sh_degree,
             self._xyz,
             self._refl_strength,
@@ -205,9 +200,60 @@ class GaussianModel:
             denom,
             opt_dict,
             self.spatial_lr_scale,
-            self._anchor_feat,
-            idiv_state,
-            iiv_state) = model_args
+            _legacy_unused_feat,
+            self._ncif_dir,
+            *_legacy_states) = model_args
+        elif len(model_args) == 23:
+            (self.active_sh_degree,
+            self._xyz,
+            self._refl_strength,
+            self._metalness,
+            self._roughness,
+            self._ori_color,
+            self._diffuse_color,
+            self._features_dc,
+            self._features_rest,
+            self._indirect_dc,
+            self._indirect_rest,
+            self._indirect_asg,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal1,
+            self._normal2,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._ncif_dir,
+            *_legacy_states) = model_args
+        elif len(model_args) >= 25:
+            (self.active_sh_degree,
+            self._xyz,
+            self._refl_strength,
+            self._metalness,
+            self._roughness,
+            self._ori_color,
+            self._diffuse_color,
+            self._features_dc,
+            self._features_rest,
+            self._indirect_dc,
+            self._indirect_rest,
+            self._indirect_asg,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal1,
+            self._normal2,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            _legacy_unused_feat,
+            *_legacy_states) = model_args
+            self._ncif_dir = torch.zeros((self._xyz.shape[0], 3), device="cuda")
         else:
             (self.active_sh_degree,
             self._xyz,
@@ -231,21 +277,14 @@ class GaussianModel:
             denom,
             opt_dict,
             self.spatial_lr_scale) = model_args
-            self._anchor_feat = torch.zeros((self._xyz.shape[0], self.anchor_feat_dim), device="cuda")
-            idiv_state = None
-            iiv_state = None
+            self._ncif_dir = torch.zeros((self._xyz.shape[0], 3), device="cuda")
         self._indirect_asg = nn.Parameter(torch.zeros(self._rotation.shape[0], 32, 5, device='cuda').requires_grad_(True))
+        if not isinstance(self._ncif_dir, nn.Parameter):
+            self._ncif_dir = nn.Parameter(self._ncif_dir.to("cuda").requires_grad_(True))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         # self.optimizer.load_state_dict(opt_dict)
-        if self.use_idiv and self.mlp_idiv is not None and idiv_state is not None:
-            try:
-                self.mlp_idiv.load_state_dict(idiv_state)
-            except RuntimeError:
-                print("Skipping incompatible IDIV MLP checkpoint; rebuilding material-agnostic IDIV decoder.")
-        if self.use_iiv and self.mlp_iiv is not None and iiv_state is not None:
-            self.mlp_iiv.load_state_dict(iiv_state)
 
     def set_opacity_lr(self, lr):   
         for param_group in self.optimizer.param_groups:
@@ -268,7 +307,7 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
-    @property
+    @property   
     def get_refl(self): 
         return self.refl_activation(self._refl_strength)
 
@@ -288,19 +327,10 @@ class GaussianModel:
     def get_diffuse_color(self): 
         return self.color_activation(self._diffuse_color)
 
-    @property
-    def get_anchor_feat(self):
-        return self._anchor_feat
-
-    def get_idiv(self):
-        if self.mlp_idiv is None:
+    def get_ncif_dir(self):
+        if not self.use_ncif or self._ncif_dir.numel() == 0:
             return None
-        return self.mlp_idiv(self._anchor_feat)
-
-    def get_iiv(self, reflection, normals):
-        if self.mlp_iiv is None:
-            return None
-        return self.mlp_iiv(torch.cat([self._anchor_feat, reflection, normals], dim=-1))
+        return self._ncif_dir
     
 
     def get_normal(self, scaling_modifier, dir_pp_normalized, return_delta=False): 
@@ -433,8 +463,8 @@ class GaussianModel:
         normals2 = np.copy(normals1)
         self._normal1 = nn.Parameter(torch.from_numpy(normals1).to(self._xyz.device).requires_grad_(True))
         self._normal2 = nn.Parameter(torch.from_numpy(normals2).to(self._xyz.device).requires_grad_(True))
-        anchor_feat = torch.randn((self._xyz.shape[0], self.anchor_feat_dim), device="cuda") * 0.01
-        self._anchor_feat = nn.Parameter(anchor_feat.requires_grad_(True))
+        ncif_dir = torch.zeros((self._xyz.shape[0], 3), device="cuda")
+        self._ncif_dir = nn.Parameter(ncif_dir.requires_grad_(True))
 
         self.env_map = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
         self.env_map_2 = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
@@ -472,12 +502,9 @@ class GaussianModel:
             {'params': [self._indirect_rest], 'lr': training_args.indirect_lr / 20.0, "name": "ind_rest"},
             {'params': [self._indirect_asg], 'lr': training_args.asg_lr, "name": "ind_asg"},
         ])
-        if self._anchor_feat.numel() > 0:
-            l.append({'params': [self._anchor_feat], 'lr': training_args.anchor_feat_lr, "name": "anchor_feat"})
-        if self.mlp_idiv is not None:
-            l.append({'params': self.mlp_idiv.parameters(), 'lr': training_args.idiv_mlp_lr, "name": "idiv_mlp"})
-        if self.mlp_iiv is not None:
-            l.append({'params': self.mlp_iiv.parameters(), 'lr': training_args.iiv_mlp_lr, "name": "iiv_mlp"})
+        if self._ncif_dir.numel() > 0:
+            ncif_lr = training_args.ncif_lr if self.use_ncif else 0.0
+            l.append({'params': [self._ncif_dir], 'lr': ncif_lr, "name": "ncif_dir"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -512,9 +539,8 @@ class GaussianModel:
             l.append('ori_color_{}'.format(i))
         for i in range(self._diffuse_color.shape[1]):  # Add diffuse_color attributes
             l.append('diffuse_color_{}'.format(i))
-        for i in range(self._anchor_feat.shape[1]):
-            l.append('anchor_feat_{}'.format(i))
-
+        for i in range(self._ncif_dir.shape[1]):
+            l.append('ncif_dir_{}'.format(i))
 
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -537,7 +563,7 @@ class GaussianModel:
         roughness = self._roughness.detach().cpu().numpy()    
         ori_color = self._ori_color.detach().cpu().numpy()    
         diffuse_color = self._diffuse_color.detach().cpu().numpy()  
-        anchor_feat = self._anchor_feat.detach().cpu().numpy()
+        ncif_dir = self._ncif_dir.detach().cpu().numpy()
         
         normals1 = self._normal1.detach().cpu().numpy()
         normals2 = self._normal2.detach().cpu().numpy() 
@@ -550,7 +576,7 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
 
-        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, anchor_feat, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, ncif_dir, scale, rotation), axis=1)
 
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
@@ -563,13 +589,6 @@ class GaussianModel:
         if self.env_map_2 is not None:
             save_path = path.replace('.ply', '2.map')
             torch.save(self.env_map_2.state_dict(), save_path)
-
-        if self.mlp_idiv is not None:
-            torch.save(self.mlp_idiv.state_dict(), path.replace('.ply', '.idiv_mlp'))
-
-        if self.mlp_iiv is not None:
-            torch.save(self.mlp_iiv.state_dict(), path.replace('.ply', '.iiv_mlp'))
-                
 
     def reset_opacity0(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -618,7 +637,7 @@ class GaussianModel:
 
     def dist_albedo(self, exclusive_msk = None):
         DIST_RANGE = 0.4
-        refl_msk = self.get_metalness.flatten() > self.metal_msk_thr
+        refl_msk = self.get_refl.flatten() > self.refl_msk_thr
         if exclusive_msk is not None:
             refl_msk = torch.logical_or(refl_msk, exclusive_msk)
         dcc = self._ori_color.clone()
@@ -630,7 +649,7 @@ class GaussianModel:
 
     def dist_color(self, exclusive_msk = None):
         DIST_RANGE = 0.4
-        refl_msk = self.get_metalness.flatten() > self.metal_msk_thr
+        refl_msk = self.get_refl.flatten() > self.refl_msk_thr
         if exclusive_msk is not None:
             refl_msk = torch.logical_or(refl_msk, exclusive_msk)
         dcc = self._features_dc.clone()
@@ -642,10 +661,10 @@ class GaussianModel:
 
     def enlarge_refl_scales(self, ret_raw=True, ENLARGE_SCALE=1.5, REFL_MSK_THR=0.02, ROUGH_MSK_THR=0.1, exclusive_msk=None):
         ENLARGE_SCALE = self.enlarge_scale
-        METAL_MSK_THR = self.metal_msk_thr
+        REFL_MSK_THR = self.refl_msk_thr
         ROUGH_MSK_THR = self.rough_msk_thr
 
-        refl_msk = self.get_metalness.flatten() < METAL_MSK_THR
+        refl_msk = self.get_refl.flatten() < REFL_MSK_THR
         rough_msk = self.get_rough.flatten() > ROUGH_MSK_THR
         combined_msk = torch.logical_or(refl_msk, rough_msk)
         if exclusive_msk is not None:
@@ -713,15 +732,51 @@ class GaussianModel:
         if "refl_strength" in optimizable_tensors:
             self._refl_strength = optimizable_tensors["refl_strength"]
 
-    def reset_metalness(self, reset_value=0.05):
+    def reset_metalness(self, reset_value=0.5):
         metalness_new = torch.full_like(self._metalness, reset_value, dtype=torch.float, device="cuda")
         optimizable_tensors = self.replace_tensor_to_optimizer(
             self.inverse_metalness_activation(metalness_new), "metalness")
         if "metalness" in optimizable_tensors:
             self._metalness = optimizable_tensors["metalness"]
-    
+
     def reset_roughness(self, reset_value=0.1):
         roughness_new = torch.full_like(self._roughness, reset_value, dtype=torch.float, device="cuda")
+        optimizable_tensors = self.replace_tensor_to_optimizer(self.inverse_roughness_activation(roughness_new), "roughness")
+        if "roughness" in optimizable_tensors:
+            self._roughness = optimizable_tensors["roughness"]
+
+    def _blend01(self, current_value, reset_value, keep_ratio):
+        target = torch.full_like(current_value, reset_value, dtype=torch.float, device="cuda")
+        return torch.clamp(current_value * keep_ratio + target * (1.0 - keep_ratio), 1e-4, 1.0 - 1e-4)
+
+    def soft_reset_ori_color(self, reset_value=0.5, keep_ratio=0.75):
+        color_new = self._blend01(self.get_ori_color, reset_value, keep_ratio)
+        optimizable_tensors = self.replace_tensor_to_optimizer(self.inverse_color_activation(color_new), "ori_color")
+        if "ori_color" in optimizable_tensors:
+            self._ori_color = optimizable_tensors["ori_color"]
+
+    def soft_reset_diffuse_color(self, reset_value=0.5, keep_ratio=0.75):
+        color_new = self._blend01(self.get_diffuse_color, reset_value, keep_ratio)
+        optimizable_tensors = self.replace_tensor_to_optimizer(
+            self.inverse_color_activation(color_new), "diffuse_color")
+        if "diffuse_color" in optimizable_tensors:
+            self._diffuse_color = optimizable_tensors["diffuse_color"]
+
+    def soft_reset_refl_strength(self, reset_value=0.01, keep_ratio=0.75):
+        refl_new = self._blend01(self.get_refl, reset_value, keep_ratio)
+        optimizable_tensors = self.replace_tensor_to_optimizer(self.inverse_refl_activation(refl_new), "refl_strength")
+        if "refl_strength" in optimizable_tensors:
+            self._refl_strength = optimizable_tensors["refl_strength"]
+
+    def soft_reset_metalness(self, reset_value=0.5, keep_ratio=0.75):
+        metalness_new = self._blend01(self.get_metalness, reset_value, keep_ratio)
+        optimizable_tensors = self.replace_tensor_to_optimizer(
+            self.inverse_metalness_activation(metalness_new), "metalness")
+        if "metalness" in optimizable_tensors:
+            self._metalness = optimizable_tensors["metalness"]
+
+    def soft_reset_roughness(self, reset_value=0.1, keep_ratio=0.75):
+        roughness_new = self._blend01(self.get_rough, reset_value, keep_ratio)
         optimizable_tensors = self.replace_tensor_to_optimizer(self.inverse_roughness_activation(roughness_new), "roughness")
         if "roughness" in optimizable_tensors:
             self._roughness = optimizable_tensors["roughness"]
@@ -743,14 +798,14 @@ class GaussianModel:
         diffuse_color = np.stack((np.asarray(plydata.elements[0]['diffuse_color_0']),
                                 np.asarray(plydata.elements[0]['diffuse_color_1']),
                                 np.asarray(plydata.elements[0]['diffuse_color_2'])),  axis=1)
-        anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("anchor_feat_")]
-        anchor_feat_names = sorted(anchor_feat_names, key=lambda x: int(x.split('_')[-1]))
-        if anchor_feat_names:
-            anchor_feat = np.zeros((xyz.shape[0], len(anchor_feat_names)))
-            for idx, attr_name in enumerate(anchor_feat_names):
-                anchor_feat[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        ncif_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("ncif_dir_")]
+        ncif_names = sorted(ncif_names, key=lambda x: int(x.split('_')[-1]))
+        if ncif_names:
+            ncif_dir = np.zeros((xyz.shape[0], len(ncif_names)))
+            for idx, attr_name in enumerate(ncif_names):
+                ncif_dir[:, idx] = np.asarray(plydata.elements[0][attr_name])
         else:
-            anchor_feat = np.random.randn(xyz.shape[0], self.anchor_feat_dim) * 0.01
+            ncif_dir = np.zeros((xyz.shape[0], 3))
         
         roughness = np.asarray(plydata.elements[0]["roughness"])[..., np.newaxis] # #
         metalness = np.asarray(plydata.elements[0]["metalness"])[..., np.newaxis] # #
@@ -827,25 +882,6 @@ class GaussianModel:
             map_path = path.replace('.ply', '.hdr')
             self.env_map = EnvLight(path=map_path, device='cuda', trainable=True).cuda()
 
-        idiv_mlp_path = path.replace('.ply', '.idiv_mlp')
-        if self.mlp_idiv is not None and os.path.exists(idiv_mlp_path):
-            try:
-                self.mlp_idiv.load_state_dict(torch.load(idiv_mlp_path))
-            except RuntimeError:
-                print("Skipping incompatible saved IDIV MLP.")
-        elif self.mlp_idiv is not None:
-            print(f"Warning: IDIV MLP weights not found at {idiv_mlp_path}; using freshly initialized IDIV MLP.")
-
-        iiv_mlp_path = path.replace('.ply', '.iiv_mlp')
-        if self.mlp_iiv is not None and os.path.exists(iiv_mlp_path):
-            try:
-                self.mlp_iiv.load_state_dict(torch.load(iiv_mlp_path))
-            except RuntimeError:
-                print("Skipping incompatible saved IIV MLP.")
-        elif self.mlp_iiv is not None:
-            print(f"Warning: IIV MLP weights not found at {iiv_mlp_path}; using freshly initialized IIV MLP.")
-
-
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._refl_strength = nn.Parameter(torch.tensor(refl_strength, dtype=torch.float, device="cuda").requires_grad_(True))   # #
@@ -853,7 +889,7 @@ class GaussianModel:
         self._roughness = nn.Parameter(torch.tensor(roughness, dtype=torch.float, device="cuda").requires_grad_(True))   # #
         self._ori_color = nn.Parameter(torch.tensor(ori_color, dtype=torch.float, device="cuda").requires_grad_(True))   # #
         self._diffuse_color = nn.Parameter(torch.tensor(diffuse_color, dtype=torch.float, device="cuda").requires_grad_(True))   # #
-        self._anchor_feat = nn.Parameter(torch.tensor(anchor_feat, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._ncif_dir = nn.Parameter(torch.tensor(ncif_dir, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._normal1 = nn.Parameter(torch.tensor(normal1, dtype=torch.float, device="cuda").requires_grad_(True))       # #
         self._normal2 = nn.Parameter(torch.tensor(normal2, dtype=torch.float, device="cuda").requires_grad_(True))       # #
@@ -888,7 +924,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] in {"mlp", "env", "env2", "idiv_mlp", "iiv_mlp"}:
+            if group["name"] in {"mlp", "env", "env2"}:
                 continue   # #
             stored_state = self.optimizer.state.get(group['params'][0], None)
 
@@ -919,6 +955,8 @@ class GaussianModel:
         self._metalness = optimizable_tensors['metalness']    # #
         self._normal1 = optimizable_tensors["normal1"]        # #
         self._normal2 = optimizable_tensors["normal2"]        # #
+        if "ncif_dir" in optimizable_tensors:
+            self._ncif_dir = optimizable_tensors["ncif_dir"]
 
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -928,9 +966,6 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        if "anchor_feat" in optimizable_tensors:
-            self._anchor_feat = optimizable_tensors["anchor_feat"]
-
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
@@ -939,7 +974,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] in {"mlp", "env", "env2", "idiv_mlp", "iiv_mlp"}:
+            if group["name"] in {"mlp", "env", "env2"}:
                 continue   # #
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -960,7 +995,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_anchor_feat, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
+    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
         d = {"xyz": new_xyz,
              
         "refl_strength": new_refl_strength,    # #
@@ -968,7 +1003,7 @@ class GaussianModel:
         "roughness": new_roughness,    # #
         "ori_color": new_ori_color,    # #
         "diffuse_color": new_diffuse_color,    # #
-        "anchor_feat": new_anchor_feat,
+        "ncif_dir": new_ncif_dir,
         "normal1" : new_normal1,       # #
         "normal2" : new_normal2,       # #
 
@@ -991,8 +1026,8 @@ class GaussianModel:
         self._roughness = optimizable_tensors['roughness']    # #
         self._ori_color = optimizable_tensors['ori_color']    # #
         self._diffuse_color = optimizable_tensors['diffuse_color']    # #
-        if "anchor_feat" in optimizable_tensors:
-            self._anchor_feat = optimizable_tensors["anchor_feat"]
+        if "ncif_dir" in optimizable_tensors:
+            self._ncif_dir = optimizable_tensors["ncif_dir"]
         self._normal1 = optimizable_tensors["normal1"]        # #
         self._normal2 = optimizable_tensors["normal2"]        # #
 
@@ -1031,7 +1066,7 @@ class GaussianModel:
         new_refl_strength = self._refl_strength[selected_pts_mask].repeat(N,1)   # #
         new_ori_color = self._ori_color[selected_pts_mask].repeat(N,1)   # #
         new_diffuse_color = self._diffuse_color[selected_pts_mask].repeat(N,1)   # #
-        new_anchor_feat = self._anchor_feat[selected_pts_mask].repeat(N,1)
+        new_ncif_dir = self._ncif_dir[selected_pts_mask].repeat(N,1)
         new_roughness = self._roughness[selected_pts_mask].repeat(N,1)   # #
         new_metalness = self._metalness[selected_pts_mask].repeat(N,1)   # #
         new_normal1 = self._normal1[selected_pts_mask].repeat(N,1)        # #
@@ -1046,7 +1081,7 @@ class GaussianModel:
         
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_anchor_feat, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1064,7 +1099,7 @@ class GaussianModel:
         new_roughness = self._roughness[selected_pts_mask]   # #
         new_ori_color = self._ori_color[selected_pts_mask]   # #
         new_diffuse_color = self._diffuse_color[selected_pts_mask]   # #
-        new_anchor_feat = self._anchor_feat[selected_pts_mask]
+        new_ncif_dir = self._ncif_dir[selected_pts_mask]
         new_normal1 = self._normal1[selected_pts_mask]       # #
         new_normal2 = self._normal2[selected_pts_mask]       # #
 
@@ -1079,7 +1114,7 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_anchor_feat, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

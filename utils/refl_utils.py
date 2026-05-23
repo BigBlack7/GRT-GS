@@ -6,7 +6,14 @@ from utils.sh_utils import eval_sh
 import kornia
 
 env_rayd1 = None
-FG_LUT = torch.from_numpy(np.fromfile("assets/bsdf_256_256.bin", dtype=np.float32).reshape(1, 256, 256, 2)).cuda()
+FG_LUT = torch.from_numpy(np.fromfile("assets/bsdf_256_256.bin", dtype=np.float32).reshape(1, 256, 256, 2))
+
+def _get_fg_lut(device: torch.device) -> torch.Tensor:
+    global FG_LUT
+    if FG_LUT.device != device:
+        FG_LUT = FG_LUT.to(device, non_blocking=True)
+    return FG_LUT
+
 def init_envrayd1(H,W):
     i, j = np.meshgrid(
         np.linspace(-np.pi, np.pi, W, dtype=np.float32),
@@ -101,7 +108,7 @@ def reflection(w_o, normal):
 
 
 
-def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, surf_depth=None, indirect_light=None): #RT W2C
+def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, surf_depth=None, indirect_light=None, indirect_gate=None): #RT W2C
     global FG_LUT
     H,W,K = HWK
     rays_cam, rays_o = sample_camera_rays(HWK, R, T)
@@ -111,7 +118,8 @@ def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_ma
 
     # Query BSDF
     fg_uv = torch.cat([NdotV, roughness], -1).clamp(0, 1) 
-    fg = dr.texture(FG_LUT, fg_uv.reshape(1, -1, 1, 2).contiguous(), filter_mode="linear", boundary_mode="clamp").reshape(1, H, W, 2) 
+    fg_lut = _get_fg_lut(fg_uv.device)
+    fg = dr.texture(fg_lut, fg_uv.reshape(1, -1, 1, 2).contiguous(), filter_mode="linear", boundary_mode="clamp").reshape(1, H, W, 2)
     # Compute direct light
     direct_light = envmap(rays_refl, roughness=roughness)
     specular_weight = ((0.04 * (1 - refl_strength) + albedo * refl_strength) * fg[0][..., 0:1] + fg[0][..., 1:2]) 
@@ -119,6 +127,8 @@ def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_ma
     # visibility
     visibility = torch.ones_like(render_alpha)
     if pc.ray_tracer is not None and indirect_light is not None:
+        if indirect_gate is None:
+            indirect_gate = torch.ones_like(render_alpha)
         mask = (render_alpha>0)[..., 0]
         rays_cam, rays_o = sample_camera_rays_unnormalize(HWK, R, T)
         w_o = safe_normalize(-rays_cam)
@@ -131,8 +141,8 @@ def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_ma
         visibility[mask] = (depth >= 10).float().unsqueeze(-1)
     
         # indirect light
-        specular_light = direct_light * visibility + (1 - visibility) * indirect_light
-        indirect_color = (1 - visibility) * indirect_light * render_alpha * specular_weight
+        specular_light = direct_light * (visibility + (1 - visibility) * (1 - indirect_gate)) + (1 - visibility) * indirect_gate * indirect_light
+        indirect_color = (1 - visibility) * indirect_gate * indirect_light * render_alpha * specular_weight
     else:
         specular_light = direct_light
     
@@ -171,7 +181,8 @@ def get_full_color_volume(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_m
     fg_uv = torch.cat([NdotV, roughness], -1).clamp(0, 1) # 计算BSDF参数
     # fg = dr.texture(FG_LUT, fg_uv.reshape(1, -1, 1, 2).contiguous(), filter_mode="linear", boundary_mode="clamp").reshape(1, H, W, 2) 
     fg_uv = fg_uv.unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]
-    fg = dr.texture(FG_LUT, fg_uv, filter_mode="linear", boundary_mode="clamp").squeeze(2).squeeze(0)  # [N, 2]
+    fg_lut = _get_fg_lut(fg_uv.device)
+    fg = dr.texture(fg_lut, fg_uv, filter_mode="linear", boundary_mode="clamp").squeeze(2).squeeze(0)  # [N, 2]
     # Compute diffuse
     diffuse = envmap(normal_map, mode="diffuse") * (1-refl_strength) * albedo
     # Compute specular
@@ -182,7 +193,7 @@ def get_full_color_volume(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_m
 
 
 
-def get_full_color_volume_indirect(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, indirect_light=None): #RT W2C
+def get_full_color_volume_indirect(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, indirect_light=None, indirect_gate=None): #RT W2C
     global FG_LUT
     _, rays_o = sample_camera_rays(HWK, R, T)
     N, _ = normal_map.shape
@@ -202,13 +213,16 @@ def get_full_color_volume_indirect(envmap: torch.Tensor, xyz, albedo, HWK, R, T,
     # Query BSDF
     fg_uv = torch.cat([NdotV, roughness], -1).clamp(0, 1) 
     fg_uv = fg_uv.unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]
-    fg = dr.texture(FG_LUT, fg_uv, filter_mode="linear", boundary_mode="clamp").squeeze(2).squeeze(0)  # [N, 2]
+    fg_lut = _get_fg_lut(fg_uv.device)
+    fg = dr.texture(fg_lut, fg_uv, filter_mode="linear", boundary_mode="clamp").squeeze(2).squeeze(0)  # [N, 2]
     # Compute diffuse
     diffuse = envmap(normal_map, mode="diffuse") * (1-refl_strength) * albedo
     # Compute specular
     direct_light = envmap(rays_refl, roughness=roughness) 
     specular_weight = ((0.04 * (1 - refl_strength) + albedo * refl_strength) * fg[0][..., 0:1] + fg[0][..., 1:2]) 
-    specular_light = direct_light * visibility + (1 - visibility) * indirect_light
+    if indirect_gate is None:
+        indirect_gate = torch.ones_like(visibility)
+    specular_light = direct_light * (visibility + (1 - visibility) * (1 - indirect_gate)) + (1 - visibility) * indirect_gate * indirect_light
     specular = specular_light * specular_weight
 
     extra_dict = {
@@ -226,4 +240,3 @@ def get_full_color_volume_indirect(envmap: torch.Tensor, xyz, albedo, HWK, R, T,
 #     rays_d, _ = sample_camera_rays(HWK, R, T)
 #     rays_d, _ = reflection(rays_d, normal_map)
 #     return envmap(rays_d, mode="pure_env").permute(2,0,1)
-

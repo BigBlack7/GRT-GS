@@ -80,6 +80,11 @@ def first_order_edge_aware_loss(data, img):
     return (spatial_gradient(data[None], order=1)[0].abs() * torch.exp(-spatial_gradient(img[None], order=1)[0].abs())).sum(1).mean()
 
 
+def cubemap_tv_loss(cubemap):
+    value = torch.sigmoid(cubemap)
+    return (value[:, 1:, :, :] - value[:, :-1, :, :]).abs().mean() + (value[:, :, 1:, :] - value[:, :, :-1, :]).abs().mean()
+
+
 
 def calculate_loss(viewpoint_camera, pc, render_pkg, opt, iteration):
     tb_dict = {
@@ -136,16 +141,43 @@ def calculate_loss(viewpoint_camera, pc, render_pkg, opt, iteration):
     else:
         tb_dict["loss_depth_smooth"] = torch.zeros_like(loss)
 
-    if opt.lambda_idiv > 0 and iteration > opt.idiv_from_iter:
-        idiv_map = render_pkg.get("idiv_map")
-        if idiv_map is not None:
-            loss_idiv = first_order_edge_aware_loss(idiv_map, gt_image)
-            tb_dict["loss_idiv"] = loss_idiv.item()
-            loss = loss + opt.lambda_idiv * loss_idiv
+    if opt.lambda_ncif_smooth > 0 and iteration > opt.ncif_from_iter:
+        ncif_map = render_pkg.get("ncif_map")
+        if ncif_map is not None:
+            loss_ncif = first_order_edge_aware_loss(ncif_map, gt_image)
+            tb_dict["loss_ncif_smooth"] = loss_ncif.item()
+            loss = loss + opt.lambda_ncif_smooth * loss_ncif
         else:
-            tb_dict["loss_idiv"] = torch.zeros_like(loss)
+            tb_dict["loss_ncif_smooth"] = torch.zeros_like(loss)
     else:
-        tb_dict["loss_idiv"] = torch.zeros_like(loss)
+        tb_dict["loss_ncif_smooth"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_ncif_magnitude", 0.0) > 0 and iteration > opt.ncif_from_iter:
+        ncif_map = render_pkg.get("ncif_map")
+        if ncif_map is not None:
+            loss_ncif_magnitude = ncif_map.pow(2).mean()
+            tb_dict["loss_ncif_magnitude"] = loss_ncif_magnitude.item()
+            loss = loss + opt.lambda_ncif_magnitude * loss_ncif_magnitude
+        else:
+            tb_dict["loss_ncif_magnitude"] = torch.zeros_like(loss)
+    else:
+        tb_dict["loss_ncif_magnitude"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_env_tv", 0.0) > 0:
+        loss_env_tv = cubemap_tv_loss(pc.get_envmap.base) + cubemap_tv_loss(pc.get_envmap_2.base)
+        tb_dict["loss_env_tv"] = loss_env_tv.item()
+        loss = loss + opt.lambda_env_tv * loss_env_tv
+    else:
+        tb_dict["loss_env_tv"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_env_energy", 0.0) > 0:
+        env1 = torch.sigmoid(pc.get_envmap.base)
+        env2 = torch.sigmoid(pc.get_envmap_2.base)
+        loss_env_energy = (env1.mean() - env2.mean()).pow(2)
+        tb_dict["loss_env_energy"] = loss_env_energy.item()
+        loss = loss + opt.lambda_env_energy * loss_env_energy
+    else:
+        tb_dict["loss_env_energy"] = torch.zeros_like(loss)
 
     
     tb_dict["loss"] = loss.item()

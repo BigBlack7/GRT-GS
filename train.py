@@ -10,6 +10,7 @@
 #
 
 import os
+import html
 import torch
 import open3d as o3d
 from random import randint
@@ -60,11 +61,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     gaussians = GaussianModel(
         dataset.sh_degree,
-        anchor_feat_dim=dataset.anchor_feat_dim,
-        idiv_hidden_dim=dataset.idiv_hidden_dim,
-        iiv_hidden_dim=dataset.iiv_hidden_dim,
-        use_idiv=dataset.use_idiv,
-        use_iiv=dataset.use_iiv,
+        use_ncif=dataset.use_ncif,
     )
     set_gaussian_para(gaussians, opt, vol=(opt.volume_render_until_iter > opt.init_until_iter)) # #
     scene = Scene(dataset, gaussians)  # init all parameters(pos, scale, rot...) from pcds
@@ -124,7 +121,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         if iteration == (opt.volume_render_until_iter + 1) and opt.volume_render_until_iter > opt.init_until_iter:
-            reset_gaussian_para(gaussians, opt)
+            if opt.use_pcc:
+                soft_reset_gaussian_para(gaussians, opt)
+            else:
+                reset_gaussian_para(gaussians, opt)
 
         # Initialize envmap
         if not initial_stage:
@@ -142,7 +142,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         # Set render
-        opt.enable_idiv = dataset.use_idiv and iteration >= opt.idiv_from_iter
+        opt.enable_ncif = dataset.use_ncif and iteration >= opt.ncif_from_iter
+        opt.current_iteration = iteration
         render = select_render_method(iteration, opt, initial_stage)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, srgb=opt.srgb, opt=opt)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -178,6 +179,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_psnr_for_log = 0.4 * psnr(image, gt_image).mean().double().item() + 0.6 * ema_psnr_for_log
             if iteration % TEST_INTERVAL == 0:
                 psnr_test = evaluate_psnr(scene, render, {"pipe": pipe, "bg_color": background, "opt": opt})
+                append_eval_curve(model_path, iteration, "test_fast", None, psnr_test)
             if iteration % 10 == 0:
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
@@ -300,14 +302,20 @@ def set_gaussian_para(gaussians, opt, vol=False):
     gaussians.init_refl_value = opt.init_refl_value
     gaussians.init_metalness_value = opt.init_metalness_value
     gaussians.refl_msk_thr = opt.refl_msk_thr
-    gaussians.metal_msk_thr = opt.metal_msk_thr
 
 def reset_gaussian_para(gaussians, opt):
     gaussians.reset_ori_color()
-    gaussians.reset_diffuse_color()
     gaussians.reset_refl_strength(opt.init_refl_value)
-    gaussians.reset_metalness(opt.init_metalness_value)
     gaussians.reset_roughness(opt.init_roughness_value)
+    gaussians.refl_msk_thr = opt.refl_msk_thr
+    gaussians.rough_msk_thr = opt.rough_msk_thr
+
+
+def soft_reset_gaussian_para(gaussians, opt):
+    keep_ratio = max(0.0, min(1.0, float(opt.pcc_keep_ratio)))
+    gaussians.soft_reset_ori_color(keep_ratio=keep_ratio)
+    gaussians.soft_reset_refl_strength(opt.init_refl_value, keep_ratio=keep_ratio)
+    gaussians.soft_reset_roughness(opt.init_roughness_value, keep_ratio=keep_ratio)
     gaussians.refl_msk_thr = opt.refl_msk_thr
     gaussians.rough_msk_thr = opt.rough_msk_thr
 
@@ -410,6 +418,126 @@ def prepare_output_and_logger():
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+
+def append_eval_curve(model_path, iteration, split, l1_value, psnr_value):
+    curve_path = os.path.join(model_path, "eval_curve.txt")
+    write_header = not os.path.exists(curve_path)
+    with open(curve_path, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write(f"{'Iter':>8} {'Split':<12} {'L1':>14} {'PSNR':>14}\n")
+            f.write("-" * 52 + "\n")
+        if l1_value is None:
+            l1_text = "N/A"
+        else:
+            l1_float = float(l1_value.detach().cpu().item()) if torch.is_tensor(l1_value) else float(l1_value)
+            l1_text = f"{l1_float:.10f}"
+        psnr_float = float(psnr_value.detach().cpu().item()) if torch.is_tensor(psnr_value) else float(psnr_value)
+        f.write(f"{iteration:>8} {split:<12} {l1_text:>14} {psnr_float:>14.10f}\n")
+    try:
+        write_eval_curve_svg(curve_path, os.path.join(model_path, "eval_curve.svg"))
+    except Exception:
+        pass
+
+
+def write_eval_curve_svg(curve_path, svg_path):
+    rows = []
+    with open(curve_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 4 or not parts[0].isdigit():
+                continue
+            try:
+                rows.append({
+                    "iteration": int(parts[0]),
+                    "split": parts[1],
+                    "psnr": float(parts[3]),
+                })
+            except ValueError:
+                continue
+    if not rows:
+        return
+
+    colors = {
+        "test_fast": "#2563eb",
+        "test": "#16a34a",
+        "train": "#d97706",
+        "offline_eval": "#dc2626",
+    }
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["split"], []).append(row)
+    for values in grouped.values():
+        values.sort(key=lambda item: item["iteration"])
+
+    width, height = 920, 420
+    left, right, top, bottom = 64, 24, 34, 58
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    min_x = min(row["iteration"] for row in rows)
+    max_x = max(row["iteration"] for row in rows)
+    min_y = min(row["psnr"] for row in rows)
+    max_y = max(row["psnr"] for row in rows)
+    if max_x == min_x:
+        max_x += 1
+    if max_y == min_y:
+        max_y += 1.0
+    pad_y = max(0.25, (max_y - min_y) * 0.08)
+    min_y -= pad_y
+    max_y += pad_y
+
+    def x_pos(value):
+        return left + (value - min_x) / (max_x - min_x) * plot_w
+
+    def y_pos(value):
+        return top + (max_y - value) / (max_y - min_y) * plot_h
+
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="{left}" y="22" font-family="Arial" font-size="16" fill="#111827">Evaluation PSNR Curve</text>',
+        f'<line x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}" stroke="#9ca3af"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#9ca3af"/>',
+    ]
+
+    for idx in range(5):
+        y_val = min_y + (max_y - min_y) * idx / 4.0
+        y = y_pos(y_val)
+        svg.append(f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" stroke="#e5e7eb"/>')
+        svg.append(f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="Arial" font-size="11" fill="#4b5563">{y_val:.2f}</text>')
+
+    for idx in range(5):
+        x_val = int(round(min_x + (max_x - min_x) * idx / 4.0))
+        x = x_pos(x_val)
+        svg.append(f'<line x1="{x:.2f}" y1="{top + plot_h}" x2="{x:.2f}" y2="{top + plot_h + 5}" stroke="#9ca3af"/>')
+        svg.append(f'<text x="{x:.2f}" y="{top + plot_h + 22}" text-anchor="middle" font-family="Arial" font-size="11" fill="#4b5563">{x_val}</text>')
+
+    legend_x = left + 10
+    for idx, split in enumerate(sorted(grouped.keys())):
+        color = colors.get(split, "#6b7280")
+        y = top + 18 + idx * 18
+        svg.append(f'<line x1="{legend_x}" y1="{y}" x2="{legend_x + 18}" y2="{y}" stroke="{color}" stroke-width="3"/>')
+        svg.append(f'<text x="{legend_x + 24}" y="{y + 4}" font-family="Arial" font-size="12" fill="#374151">{html.escape(split)}</text>')
+
+    for split, values in grouped.items():
+        color = colors.get(split, "#6b7280")
+        points = " ".join(f'{x_pos(row["iteration"]):.2f},{y_pos(row["psnr"]):.2f}' for row in values)
+        if len(values) == 1:
+            row = values[0]
+            svg.append(f'<circle cx="{x_pos(row["iteration"]):.2f}" cy="{y_pos(row["psnr"]):.2f}" r="3" fill="{color}"/>')
+        else:
+            svg.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2.4"/>')
+            for row in values:
+                svg.append(f'<circle cx="{x_pos(row["iteration"]):.2f}" cy="{y_pos(row["psnr"]):.2f}" r="2.5" fill="{color}"/>')
+
+    best = max((row for row in rows if row["split"] in {"test", "test_fast"}), key=lambda row: row["psnr"], default=max(rows, key=lambda row: row["psnr"]))
+    final = max((row for row in rows if row["split"] in {"test", "test_fast"}), key=lambda row: row["iteration"], default=max(rows, key=lambda row: row["iteration"]))
+    svg.append(f'<text x="{left}" y="{height - 16}" font-family="Arial" font-size="12" fill="#111827">best {best["iteration"]}: {best["psnr"]:.3f} | final {final["iteration"]}: {final["psnr"]:.3f} | drop {best["psnr"] - final["psnr"]:.3f}</text>')
+    svg.append("</svg>")
+
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(svg))
+
+
 @torch.no_grad()
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderkwargs):
     if tb_writer:
@@ -464,6 +592,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                append_eval_curve(scene.model_path, iteration, config['name'], l1_test, psnr_test)
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)

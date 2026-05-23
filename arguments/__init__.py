@@ -67,11 +67,7 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
-        self.anchor_feat_dim = 32
-        self.idiv_hidden_dim = 64
-        self.iiv_hidden_dim = 64
-        self.use_idiv = True
-        self.use_iiv = False
+        self.use_ncif = True
         
         # Paths
         self._source_path = ""
@@ -136,9 +132,7 @@ class OptimizationParams(ParamGroup):
         self.normal_lr = 0.006
 
         self.envmap_cubemap_lr = 0.01
-        self.anchor_feat_lr = 0.0075
-        self.idiv_mlp_lr = 0.0075
-        self.iiv_mlp_lr = 0.0075
+        self.ncif_lr = 0.002
         
         # Densification Settings
         self.percent_dense = 0.01
@@ -149,18 +143,20 @@ class OptimizationParams(ParamGroup):
         self.lambda_normal_render_depth = 0.05
         self.lambda_normal_smooth = 0.0
         self.lambda_depth_smooth = 0.0
-        self.lambda_idiv = 0.005
+        self.lambda_ncif_smooth = 0.005
+        self.lambda_ncif_magnitude = 0.001
+        self.lambda_env_tv = 0.0001
+        self.lambda_env_energy = 0.0001
 
 
         # initial values
         self.init_roughness_value = 0.1
         self.init_refl_value = 0.01
         self.init_refl_value_vol = 0.01
+        self.init_metalness_value = 0.5
         self.rough_msk_thr = 0.01
         self.refl_msk_thr = 0.02
         self.refl_msk_thr_vol = 0.02
-        self.init_metalness_value = 0.05
-        self.metal_msk_thr = 0.5
 
         self.enlarge_scale = 1.5
 
@@ -183,7 +179,19 @@ class OptimizationParams(ParamGroup):
         self.volume_render_until_iter = 18000 
         self.normal_smooth_from_iter = 0
         self.normal_smooth_until_iter = 18000
-        self.idiv_from_iter = 3000
+        self.ncif_from_iter = 3000
+        self.ncif_tau = 0.15
+        self.ncif_ramp_iters = 5000
+        self.ncif_diffuse_mu = 1.0
+        self.ncif_diffuse_nu = 1.0
+        self.use_r2if = True
+        self.r2if_specular_alpha = 1.0
+        self.r2if_specular_beta = 1.0
+        self.r2if_min_specular_gate = 0.02
+        self.use_pcc = True
+        self.pcc_keep_ratio = 0.75
+        self.use_cgi = True
+        self.cgi_ramp_iters = 5000
                 
         self.indirect = 0
         self.indirect_from_iter =  20000 

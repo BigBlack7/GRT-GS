@@ -111,24 +111,23 @@ def render_set_train(model_path, views, gaussians, pipeline, background, save_im
             
 
    
-def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, save_ims: bool, op, indirect):
+def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, save_ims: bool, op, indirect_override):
     with torch.no_grad():
         gaussians = GaussianModel(
             dataset.sh_degree,
-            anchor_feat_dim=dataset.anchor_feat_dim,
-            idiv_hidden_dim=dataset.idiv_hidden_dim,
-            iiv_hidden_dim=dataset.iiv_hidden_dim,
-            use_idiv=dataset.use_idiv,
-            use_iiv=dataset.use_iiv,
+            use_ncif=dataset.use_ncif,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        iteration = searchForMaxIteration(os.path.join(dataset.model_path, "point_cloud"))
-        op.enable_idiv = dataset.use_idiv and iteration >= op.idiv_from_iter
+        iteration = scene.loaded_iter
+        if iteration is None:
+            iteration = searchForMaxIteration(os.path.join(dataset.model_path, "point_cloud"))
+        op.enable_ncif = dataset.use_ncif and iteration >= op.ncif_from_iter
+        op.current_iteration = iteration
         mesh_path = os.path.join(dataset.model_path, f'test_{iteration:06d}.ply')
-        use_indirect = (iteration >= op.indirect_from_iter and os.path.exists(mesh_path)) if indirect is None else indirect
+        use_indirect = (iteration >= op.indirect_from_iter and os.path.exists(mesh_path)) if indirect_override is None else indirect_override
         if use_indirect:
             op.indirect = 1
             gaussians.load_mesh_from_ply(dataset.model_path, iteration)
@@ -137,7 +136,7 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         print(
             "Loaded eval state: "
             f"iteration={iteration}, "
-            f"enable_idiv={op.enable_idiv}, "
+            f"enable_ncif={op.enable_ncif}, "
             f"indirect={op.indirect}, "
             f"mesh_exists={os.path.exists(mesh_path)}"
         )
@@ -169,9 +168,11 @@ if __name__ == "__main__":
     parser.add_argument("--save_images", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--gpu", type=str, default="-1")
-    parser.add_argument("--eval_indirect", dest="eval_indirect", action="store_true", default=None)
-    parser.add_argument("--no_eval_indirect", dest="eval_indirect", action="store_false")
+    parser.add_argument("--force_indirect", dest="indirect_override", action="store_true", default=None)
+    parser.add_argument("--no_indirect", dest="indirect_override", action="store_false")
     args = get_combined_args(parser)
+    if not hasattr(args, "indirect_override"):
+        args.indirect_override = None
     if args.gpu != "-1":
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     print("Rendering " + args.model_path)
@@ -185,9 +186,9 @@ if __name__ == "__main__":
     print(
         "Eval config: "
         f"iteration={args.iteration}, "
-        f"use_idiv={dataset.use_idiv}, "
-        f"idiv_from_iter={opt.idiv_from_iter}, "
+        f"use_ncif={dataset.use_ncif}, "
+        f"ncif_from_iter={opt.ncif_from_iter}, "
         f"srgb={opt.srgb}, "
-        f"eval_indirect={args.eval_indirect}"
+        f"indirect_override={args.indirect_override}"
     )
-    render_sets(dataset, args.iteration, pipe, args.save_images, opt, args.eval_indirect)
+    render_sets(dataset, args.iteration, pipe, args.save_images, opt, args.indirect_override)
