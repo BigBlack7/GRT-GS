@@ -188,6 +188,7 @@ class OptimizationParams(ParamGroup):
         self.r2if_specular_alpha = 1.0
         self.r2if_specular_beta = 1.0
         self.r2if_min_specular_gate = 0.02
+        self.r2if_gate_render = False
         self.use_pcc = True
         self.pcc_keep_ratio = 0.75
         self.use_cgi = True

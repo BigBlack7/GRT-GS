@@ -1,25 +1,25 @@
-# PhysNorm-GS：面向混合反射场景的可靠照明因子分解与法向耦合高斯逆渲染
+# PhysNorm-GS：面向混合反射场景的反射感知探针全局光照高斯逆渲染
 
 ## 摘要
 
-本文研究基于 Gaussian Splatting 的逆渲染在混合反射场景中的稳定重建问题。现有反射高斯方法通常将环境贴图、BRDF 材质、表面法向与间接光共同置于同一端到端优化框架中。该范式在高反射、低粗糙材质上能够从镜面高光中获得强约束，但在非反射物体、大规模真实场景或反射证据稀疏区域中，高频环境贴图缺乏可观测梯度，容易退化为吸收外观残差的高维噪声变量。与此同时，两阶段训练中从高斯级着色到延迟物理渲染的硬切换、材质属性的全局重置、以及基于网格可见性的互反射过早反馈，都会造成材质分解和几何优化的不稳定。
+本文研究 Gaussian Splatting 逆渲染在混合反射场景中的光照分解与稳定优化问题。现有反射高斯方法通常将高频环境贴图、BRDF 材质、法向和间接光放入同一端到端优化过程。该范式在高反射、低粗糙表面上可以从清晰镜面高光获得有效监督，但在漫反射物体、弱反射物体和大规模真实场景中，高频环境贴图缺乏可观测梯度，容易退化为吸收颜色残差的噪声变量。另一方面，仅依赖全局环境贴图也无法表达近场物体间反射和空间变化漫反射全局光照。
 
-为此，本文提出 **PhysNorm-GS**，一个面向反射与漫反射统一重建的物理引导高斯逆渲染框架。本文的核心观点是：混合反射场景中的照明、法向、材质与间接光不应由固定迭代阶段和无差别全局变量共同解释，而应由反射可靠性、几何置信度和漫反射责任进行分配。具体而言，本文提出可靠反射引导的照明因子分解，将低频辐照场与高频镜面环境贴图解耦；提出法向耦合辐照场，为漫反射区域提供有界、零初始化、可退化的法向相关辐照残差；提出阶段一致连续优化，缓解从初始化渲染到延迟物理渲染的优化断裂；提出置信度门控互反射，使间接光反馈由几何和材质可靠性共同控制。
+本文提出 **PhysNorm-GS**，一个面向混合反射场景的反射感知探针全局光照高斯逆渲染框架。核心观点是：不同材质区域对不同光照因子的可观测性不同，因此全局光照不应由单一环境贴图统一解释，而应根据反射强度、粗糙度、几何置信度和光度残差分解到远场镜面环境贴图、近场光线追踪辐射和空间漫反射辐照探针中。具体而言，本文提出 **Reflectance-Aware Probe Global Illumination, RAP-GI**：高频远场镜面反射由可靠镜面证据监督；近场镜面和互反射由局部 ray-traced transport 表达；低频漫反射全局光照由可学习 Gaussian irradiance probes 表示。训练上，本文进一步提出阶段一致连续优化以缓解 delayed rendering 阶段切换和材质重置带来的优化断裂。
 
 本文贡献如下：
 
-1. 提出 **Reliable Reflectance-Guided Illumination Factorization, R2IF**。该方法根据反射强度、粗糙度、法向可靠性、可见性与重建残差估计高频环境贴图的可观测性，仅使用可靠镜面证据优化高频环境光，并以低频空间辐照场解释非反射与大规模真实场景中的主要照明。
-2. 提出 **Normal-Coupled Irradiance Field, NCIF**。该方法以局部 Gaussian 辐照残差和空间 cell 低阶方向辐照共同建模漫反射照明，并通过零初始化、有界响应和漫反射责任门控为法向提供 photometric gradient，同时避免破坏镜面 PBR 分解。
-3. 提出 **Phase-Consistent Continuation, PCC**。该方法将训练阶段切换从硬重置改为连续过渡，通过跨阶段 RGB、法向与材质蒸馏将初始化阶段的稳定几何和外观迁移到延迟物理渲染阶段。
-4. 提出 **Confidence-Gated Interreflection, CGI**。该方法将互反射由固定迭代开关改为局部置信度驱动的物理反馈，降低不稳定网格可见性对材质和反射分解的污染。
+1. 提出 **RAP-GI：反射感知探针全局光照分解**。该方法将混合反射场景中的出射辐射分解为远场高频镜面环境、近场局部反射传输和空间低频漫反射辐照探针，并用材质可靠性决定各分量的监督责任。
+2. 提出 **Material-aware Gaussian Irradiance Probes, MGIP**。该方法在高斯场景中构建可学习的低阶方向辐照探针场，使漫反射和粗糙表面主要监督局部低频全局光照，而不是污染高频环境贴图。
+3. 提出 **Reflectance-Reliable Specular Factorization, R2SF**。该方法仅允许高反射、低粗糙、法向稳定且残差可信的区域强监督高频环境贴图，并将近场反射交给局部光线追踪传输。
+4. 提出 **Phase-Consistent Continuation, PCC**。该方法将阶段切换从硬重置改为置信度软重置和连续过渡，缓解 delayed rendering 进入物理渲染后的指标突降。
 
 ---
 
 ## 1. 问题定义
 
-### 1.1 混合反射场景中的可观测性不均衡
+### 1.1 单一环境贴图的可观测性缺陷
 
-给定多视角图像集合 $\mathcal{I}=\{I_v\}$，目标是重建由高斯基元表示的几何、外观、材质和照明。对一个像素 $\mathbf{p}$，典型物理渲染形式可写为：
+给定多视角图像集合 $\mathcal{I}=\{I_v\}$，目标是重建由高斯基元表示的几何、材质和光照。对像素 $\mathbf{p}$，物理渲染可写为：
 
 $$
 C(\mathbf{p})
@@ -31,7 +31,7 @@ S(\mathbf{p})
 I_{\mathrm{ind}}(\mathbf{p}),
 $$
 
-其中 $D$ 为漫反射或基础颜色分量，$S$ 为由 BRDF 和环境光驱动的镜面分量，$I_{\mathrm{ind}}$ 为互反射或间接光项。镜面分量通常依赖反射方向：
+其中 $D$ 为漫反射项，$S$ 为镜面项，$I_{\mathrm{ind}}$ 为间接光或互反射项。镜面项通常通过反射方向查询环境贴图：
 
 $$
 \omega_r
@@ -41,61 +41,73 @@ $$
 \omega_o,
 $$
 
-并通过粗糙度 $r$ 和反射强度 $\rho$ 查询环境照明：
-
 $$
 S
 =
 f_s(\mathbf{n},\omega_o,r,\rho,E).
 $$
 
-当 $\rho$ 较大且 $r$ 较小时，图像中存在清晰的镜面证据，高频环境贴图 $E$、法向 $\mathbf{n}$ 和材质参数可以得到较强约束。相反，当 $\rho \rightarrow 0$ 或 $r \rightarrow 1$ 时，高频环境贴图对像素颜色的影响迅速衰减。此时强行优化高维环境贴图会导致如下问题：
-
-1. 环境贴图梯度稀疏且病态，无法从图像中可靠恢复。
-2. 高频环境贴图会吸收相机曝光、背景、albedo、几何误差和动态残差。
-3. 非反射场景中，物理分解变量越多，越容易降低 RGB 重建稳定性。
-4. 大规模真实场景中，单一全局环境贴图不足以解释空间变化照明。
-
-这解释了一个常见现象：反射逆渲染方法在光滑反射物体上表现较好，但在非反射物体或真实开放场景中，环境贴图可能优化成彩色噪声，从而反过来损害 PSNR、SSIM 和 LPIPS。
-
-### 1.2 阶段切换导致的优化断裂
-
-许多反射高斯逆渲染流程采用两阶段训练：先用较稳定的高斯级着色获得几何与初始外观，再切换到延迟物理渲染以优化材质、法向和照明。若在阶段切换时全局重置颜色和材质，仅保留几何，则优化问题从
+其中 $\rho$ 是反射强度，$r$ 是粗糙度，$E$ 是环境贴图。对环境贴图 texel $E_k$ 的梯度近似为：
 
 $$
-\min_{\mathcal{G},\theta_0}
-\mathcal{L}_{\mathrm{init}}
+\frac{\partial C}{\partial E_k}
+=
+w_s(\rho,r,\mathbf{n},\omega_o)
+\frac{\partial E(\omega_r,r)}{\partial E_k}.
+$$
+
+当 $\rho\rightarrow 0$ 或 $r\rightarrow 1$ 时，镜面权重 $w_s$ 迅速衰减，高频环境贴图几乎不可观测。因此漫反射区域不应强监督高频环境贴图。若仍允许所有像素无差别优化 $E$，优化器会把 albedo、曝光、几何误差和未建模间接光写入环境贴图，形成彩色噪声。
+
+### 1.2 漫反射全局光照的空间变化
+
+漫反射颜色来自半球入射辐射积分：
+
+$$
+D(\mathbf{x},\mathbf{n})
+=
+A(\mathbf{x})
+\int_{\Omega^+}
+L_i(\mathbf{x},\omega)
+\max(0,\mathbf{n}^{\top}\omega)
+d\omega .
+$$
+
+该积分天然是低频的，并且依赖空间位置 $\mathbf{x}$。因此，大规模真实场景或多物体场景中的漫反射照明更适合由空间辐照场表达，而不是由单个全局环境贴图表达。传统图形学中的 irradiance volume、light probes 和 DDGI 正是针对这一问题：用空间探针缓存低频漫反射全局光照，并通过可见性降低漏光。
+
+### 1.3 近场反射与远场反射的冲突
+
+环境贴图适合描述天空、背景和远场照明，但无法表达局部物体在镜面表面中的近场反射。对低粗糙镜面表面，局部几何与遮挡会显著影响反射外观：
+
+$$
+S_{\mathrm{near}}
+=
+f_s(\mathbf{n},\omega_o,r,\rho,L_{\mathrm{local}}).
+$$
+
+若只使用全局环境贴图，近场物体反射会被错误写入 $E$，导致背景与物体反射互相污染。反过来，若只使用局部 ray tracing，又难以覆盖远场天空和不可见背景。因此需要远场与近场分解。
+
+### 1.4 阶段切换导致的优化断裂
+
+反射高斯逆渲染通常先使用稳定的高斯级着色获得几何，再切换到 delayed physical rendering 优化材质、法向、环境光和间接光。若阶段切换时全局重置颜色和材质，则优化目标从
+
+$$
+\min_{\mathcal{G},\theta_0}\mathcal{L}_{\mathrm{init}}
 $$
 
 突然变为
 
 $$
-\min_{\mathcal{G},\theta_{\mathrm{pbr}},E}
+\min_{\mathcal{G},\theta_{\mathrm{pbr}},E,\mathcal{P}}
 \mathcal{L}_{\mathrm{pbr}},
 $$
 
-其中 $\theta_0$ 和 $\theta_{\mathrm{pbr}}$ 的参数含义、渲染路径和梯度分布均不同。该硬切换会产生 optimization phase shift：训练曲线在阶段边界附近突然下降，部分场景即使继续训练也难以恢复早期指标。
-
-### 1.3 本文目标
-
-本文不把混合反射重建视为单纯增加材质变量或照明变量的问题，而将其表述为一个可靠性分配问题：
-
-$$
-\text{Which observation should supervise which physical factor?}
-$$
-
-本文希望满足四个原则：
-
-1. 高频环境贴图只由可靠镜面证据监督。
-2. 漫反射区域不应被迫通过高频环境贴图解释，而应由低频辐照和法向耦合残差解释。
-3. 阶段切换应保持颜色、法向和材质的一致性。
-4. 互反射只应在几何和材质均可靠时参与反馈。
+其中 $\mathcal{P}$ 为探针光照参数。该硬切换会造成训练曲线突降，部分场景即使继续训练也难以恢复早期指标。
 
 ---
 
 ## 2. 方法概览
 
-PhysNorm-GS 使用表面高斯基元表示场景。每个 Gaussian $G_i$ 维护位置、尺度、旋转、不透明度、基础颜色、反射强度、粗糙度、法向相关参数以及局部辐照残差：
+PhysNorm-GS 使用 surface-aligned Gaussian primitives 表示几何和材质，并额外维护一个空间辐照探针场。每个 Gaussian $G_i$ 维护：
 
 $$
 G_i
@@ -108,475 +120,355 @@ G_i
 \mathbf{a}_i,
 \rho_i,
 r_i,
-\mathbf{d}_i
-\}.
+\mathbf{n}_i
+\},
 $$
 
-渲染时先通过 splatting 聚合 G-buffer，再执行像素级物理着色。最终颜色写为：
+其中 $\mathbf{a}_i$ 是基础颜色，$\rho_i$ 是反射强度，$r_i$ 是粗糙度。探针场为：
+
+$$
+\mathcal{P}
+=
+\{
+(\mathbf{p}_j,\mathbf{c}_{j,lm},v_j)
+\}_{j=1}^{N_p},
+$$
+
+其中 $\mathbf{p}_j$ 是 probe 位置，$\mathbf{c}_{j,lm}$ 是低阶球谐辐照系数，$v_j$ 是可选可见性或置信度统计。
+
+最终颜色分解为：
 
 $$
 C
 =
-D_{\mathrm{NCIF}}
+D_{\mathrm{probe}}
 +
-S_{\mathrm{R2IF}}
+S_{\mathrm{far}}
 +
-I_{\mathrm{CGI}}
+S_{\mathrm{near}}
 +
 C_{\mathrm{bg}}.
 $$
 
 其中：
 
-- $D_{\mathrm{NCIF}}$ 是法向耦合辐照场产生的漫反射分量。
-- $S_{\mathrm{R2IF}}$ 是由可靠反射证据约束的镜面分量。
-- $I_{\mathrm{CGI}}$ 是置信度门控的互反射项。
-- $C_{\mathrm{bg}}$ 是背景和透明度混合项。
+- $D_{\mathrm{probe}}$：由 Gaussian irradiance probes 提供的漫反射低频全局光照。
+- $S_{\mathrm{far}}$：由高频环境贴图提供的远场镜面反射。
+- $S_{\mathrm{near}}$：由局部 ray-traced transport 提供的近场镜面反射和互反射。
+- $C_{\mathrm{bg}}$：背景与透明度混合项。
 
-整体优化目标为：
+核心思想不是让所有像素同时监督所有变量，而是用材质责任权重分配梯度：
 
 $$
-\mathcal{L}
+q_{\mathrm{diff}}
 =
-\mathcal{L}_{\mathrm{rgb}}
-+
-\lambda_{\mathrm{geo}}\mathcal{L}_{\mathrm{geo}}
-+
-\lambda_{\mathrm{illum}}\mathcal{L}_{\mathrm{illum}}
-+
-\lambda_{\mathrm{ncif}}\mathcal{L}_{\mathrm{ncif}}
-+
-\lambda_{\mathrm{phase}}\mathcal{L}_{\mathrm{phase}}
-+
-\lambda_{\mathrm{ind}}\mathcal{L}_{\mathrm{ind}}.
+(1-\rho)^\mu r^\nu q_{\mathrm{geo}}q_{\mathrm{photo}},
 $$
+
+$$
+q_{\mathrm{spec}}
+=
+\rho^\alpha(1-r)^\beta q_{\mathrm{geo}}q_{\mathrm{photo}},
+$$
+
+$$
+q_{\mathrm{rough}}
+=
+\rho^\alpha r^\eta q_{\mathrm{geo}}q_{\mathrm{photo}}.
+$$
+
+$q_{\mathrm{diff}}$ 高的区域主要监督探针辐照，$q_{\mathrm{spec}}$ 高的区域主要监督远场环境贴图和近场 ray-traced radiance，$q_{\mathrm{rough}}$ 对粗糙镜面提供低频反射混合。
 
 ---
 
-## 3. R2IF：可靠反射引导的照明因子分解
+## 3. RAP-GI：反射感知全局光照分解
 
-### 3.1 高频环境贴图不可观测性的梯度分析
+### 3.1 三路光照分解
 
-考虑镜面项：
+本文将入射光照分为三部分：
 
 $$
-S(\mathbf{p})
+L_i(\mathbf{x},\omega)
 =
-w_s(\mathbf{p})
-E(\omega_r(\mathbf{p}),r(\mathbf{p})),
-$$
-
-其中 $w_s$ 是由 Fresnel、反射强度、粗糙度、alpha 和 BRDF 查表共同决定的权重。对环境贴图 texel $E_k$ 的梯度可写为：
-
-$$
-\frac{\partial C(\mathbf{p})}{\partial E_k}
-=
-w_s(\mathbf{p})
-\frac{\partial E(\omega_r,r)}{\partial E_k}.
-$$
-
-当 $\rho \rightarrow 0$ 时，$w_s \rightarrow 0$；当 $r$ 较大时，环境查询被强低通滤波，单个高频 texel 的梯度也趋于弱化。因此：
-
-$$
-\left\|
-\frac{\partial C}{\partial E_{\mathrm{HF}}}
-\right\|
-\rightarrow 0
-\quad
-\text{if}
-\quad
-\rho \rightarrow 0
-\quad
-\text{or}
-\quad
-r \rightarrow 1.
-$$
-
-这说明高频环境贴图在低反射或高粗糙区域不可辨识。若仍允许所有像素更新高频环境贴图，优化器会把无法由当前模型解释的颜色残差写入 $E_{\mathrm{HF}}$，形成噪声环境贴图。
-
-### 3.2 可靠反射门控
-
-本文定义高频环境贴图的可靠性权重：
-
-$$
-q_{\mathrm{spec}}
-=
-\rho^\alpha
-\cdot
-(1-r)^\beta
-\cdot
-q_{\mathrm{n}}
-\cdot
-q_{\mathrm{vis}}
-\cdot
-q_{\mathrm{photo}}.
-$$
-
-其中：
-
-$$
-q_{\mathrm{n}}
-=
-\exp
-\left(
--
-\kappa_n
-\left[
-1-
-\langle
-\mathbf{n}_{\mathrm{render}},
-\mathbf{n}_{\mathrm{depth}}
-\rangle
-\right]
-\right),
-$$
-
-$$
-q_{\mathrm{photo}}
-=
-\exp
-\left(
--
-\kappa_p
-\|C-I\|_1
-\right),
-$$
-
-$$
-q_{\mathrm{vis}}
-=
-\mathrm{clip}
-\left(
-\frac{m_i}{m_0},0,1
-\right),
-$$
-
-$m_i$ 表示 Gaussian 或像素的多视角可见次数。直观上，只有高反射、低粗糙、法向稳定、视角覆盖充分且 photometric residual 不异常的区域，才允许强监督高频环境贴图。
-
-### 3.3 低频和高频照明分解
-
-本文将照明分解为低频空间辐照和高频镜面环境：
-
-$$
-L(\mathbf{x},\omega,\mathbf{n})
-=
-L_{\mathrm{LF}}(\mathbf{x},\mathbf{n})
+L_{\mathrm{probe}}(\mathbf{x},\omega)
 +
-q_{\mathrm{spec}}(\mathbf{x})
-E_{\mathrm{HF}}(\omega).
+L_{\mathrm{env}}(\omega)
++
+L_{\mathrm{local}}(\mathbf{x},\omega).
 $$
 
-低频辐照场使用空间 cell 上的低阶球谐函数表示：
+$L_{\mathrm{probe}}$ 是空间低频漫反射辐照，$L_{\mathrm{env}}$ 是远场高频环境光，$L_{\mathrm{local}}$ 是由局部几何产生的近场反射与互反射。
+
+对漫反射项：
 
 $$
-L_{\mathrm{LF}}(\mathbf{x},\mathbf{n})
+D_{\mathrm{probe}}
 =
-\sum_{l=0}^{L}
-\sum_{m=-l}^{l}
-\mathbf{c}_{c(\mathbf{x}),lm}
-Y_{lm}(\mathbf{n}),
+A(\mathbf{x})
+I_{\mathcal{P}}(\mathbf{x},\mathbf{n}),
 $$
 
-其中 $c(\mathbf{x})$ 是空间 cell 索引，$Y_{lm}$ 是球谐基。该项主要解释非反射物体、大场景中的空间变化漫反射照明，以及真实图像中的低频光照差异。
+其中 $I_{\mathcal{P}}$ 是由探针插值得到的方向辐照。
 
-高频环境贴图只用于镜面分量：
+对远场镜面项：
 
 $$
-S_{\mathrm{R2IF}}
+S_{\mathrm{far}}
 =
 q_{\mathrm{spec}}
-f_s
-(
-\mathbf{n},
-\omega_o,
-r,
-\rho,
-E_{\mathrm{HF}}
-).
+f_s(\mathbf{n},\omega_o,r,\rho,E_{\mathrm{HF}}).
 $$
 
-### 3.4 环境贴图正则
+对近场镜面和互反射：
 
-为了防止高频环境贴图成为残差噪声，本文加入三类约束：
+$$
+S_{\mathrm{near}}
+=
+\gamma_t q_{\mathrm{spec}} q_{\mathrm{vis}}
+f_s(\mathbf{n},\omega_o,r,\rho,L_{\mathrm{local}}),
+$$
+
+其中 $L_{\mathrm{local}}$ 由当前高斯表面或提取网格上的 ray tracing 得到，$\gamma_t$ 是训练中逐步启用的 ramp 权重。
+
+### 3.2 可观测性驱动的梯度分配
+
+对高频环境贴图，本文只允许可靠镜面区域强监督：
 
 $$
 \mathcal{L}_{E}
 =
+q_{\mathrm{spec}}
+\rho_{\mathrm{rgb}}
+\left(
+C-I
+\right)
++
 \lambda_{\mathrm{tv}}
 \|\nabla_{\mathbb{S}^2}E_{\mathrm{HF}}\|_1
 +
 \lambda_{\mathrm{eng}}
-\left(
-\overline{E}_{\mathrm{HF}}-\overline{L}_{\mathrm{LF}}
-\right)^2
-+
-\lambda_{\mathrm{sat}}
-\|\max(E_{\mathrm{HF}}-E_{\max},0)\|_2^2.
+\mathcal{L}_{\mathrm{energy}}.
 $$
 
-其中第一项是球面 TV，第二项约束全局能量，第三项抑制颜色爆炸。训练早期或低反射场景中，$E_{\mathrm{HF}}$ 可保持冻结或只允许低学习率更新。
+对探针场，本文主要使用漫反射责任监督：
+
+$$
+\mathcal{L}_{\mathcal{P}}
+=
+q_{\mathrm{diff}}
+\rho_{\mathrm{rgb}}
+\left(
+C-I
+\right)
++
+\lambda_{\mathrm{probe}}
+\mathcal{R}(\mathcal{P}).
+$$
+
+这使低反射区域不再把残差写入高频环境贴图，而是更新空间低频辐照。
+
+### 3.3 与传统 GI 的关系
+
+传统 irradiance probes 和 DDGI 在前向渲染中通过探针缓存漫反射全局光照。本文将该思想转化为逆渲染中的可学习物理因子：probe 不再由已知场景和已知光源离线烘焙，而是由多视角图像、Gaussian 几何和材质责任共同优化。与传统 DDGI 相同，探针表达低频漫反射 GI；与传统 DDGI 不同，本文需要解决的是光照、材质和几何共同未知时的可观测性分配问题。
 
 ---
 
-## 4. NCIF：法向耦合辐照场
+## 4. MGIP：材质感知 Gaussian Irradiance Probes
 
-### 4.1 设计动机
+### 4.1 探针表示
 
-在低反射区域，镜面项弱，颜色对法向的梯度不足：
-
-$$
-\left\|
-\frac{\partial S}{\partial \mathbf{n}}
-\right\|
-\approx 0.
-$$
-
-若漫反射项仅为颜色贴图或基础颜色：
+每个 probe 维护低阶球谐辐照：
 
 $$
-D=A,
-$$
-
-则 RGB loss 很难直接修正法向。本文提出法向耦合辐照场，使漫反射颜色与法向建立有界联系。
-
-### 4.2 局部与空间多尺度辐照残差
-
-定义漫反射责任：
-
-$$
-q_{\mathrm{diff}}
+I_j(\mathbf{n})
 =
-(1-\rho)^\mu
-r^\nu
-q_{\mathrm{n}}
-q_{\mathrm{vis}}.
-$$
-
-其中低反射、高粗糙、法向可靠且可见充分的区域更依赖 NCIF。对像素 $\mathbf{p}$，聚合局部辐照残差：
-
-$$
-\bar{\mathbf{d}}(\mathbf{p})
-=
-\sum_{i\in \mathcal{R}(\mathbf{p})}
-T_i\alpha_i
-\mathbf{d}_i.
-$$
-
-空间 cell 的方向辐照残差为：
-
-$$
-H_{c(\mathbf{p})}(\mathbf{n})
-=
-\sum_{l=0}^{L'}
+\sum_{l=0}^{L}
 \sum_{m=-l}^{l}
-\mathbf{h}_{c(\mathbf{p}),lm}
+\mathbf{c}_{j,lm}
 Y_{lm}(\mathbf{n}).
 $$
 
-NCIF 的响应定义为：
+对任意高斯或像素位置 $\mathbf{x}$，选择邻近 probes 并插值得到：
 
 $$
-R_{\mathrm{NCIF}}
+I_{\mathcal{P}}(\mathbf{x},\mathbf{n})
 =
-\tau
+\sum_{j\in\mathcal{N}(\mathbf{x})}
+w_j(\mathbf{x})
+I_j(\mathbf{n}).
+$$
+
+最小实现中，probes 可放置在场景 bounding box 的规则网格中，使用 trilinear interpolation。进一步实现中，probes 可依据 Gaussian 密度和可见性自适应布置。
+
+### 4.2 漫反射责任门控
+
+探针只应由漫反射或粗糙表面强监督。定义：
+
+$$
 q_{\mathrm{diff}}
-\tanh
-\left(
-\mathbf{n}^{\top}\bar{\mathbf{d}}
-+
-H_{c(\mathbf{p})}(\mathbf{n})
-\right).
+=
+(1-\rho)^\mu r^\nu q_{\mathrm{n}}q_{\mathrm{vis}}q_{\mathrm{photo}}.
 $$
 
-最终漫反射项为：
+其中 $q_{\mathrm{n}}$ 衡量法向一致性，$q_{\mathrm{vis}}$ 衡量多视角覆盖，$q_{\mathrm{photo}}$ 抑制异常残差。最终漫反射项为：
 
 $$
-D_{\mathrm{NCIF}}
+D_{\mathrm{probe}}
 =
 A
-L_{\mathrm{LF}}(\mathbf{x},\mathbf{n})
+\left[
+(1-\tau q_{\mathrm{diff}}) I_0
++
+\tau q_{\mathrm{diff}} I_{\mathcal{P}}(\mathbf{x},\mathbf{n})
+\right],
+$$
+
+其中 $I_0$ 是基础低频照明或初始化颜色，$\tau$ 是 probe 启用强度。该形式保证 probe 在训练初期可退化，不会立即破坏已有 PBR 路径。
+
+### 4.3 有界残差版本
+
+为了避免探针成为任意颜色场，可将 probe 写成基础辐照上的有界残差：
+
+$$
+I_{\mathcal{P}}
+=
+I_{\mathrm{base}}
++
+\Delta I_{\mathcal{P}},
+$$
+
+$$
+\Delta I_{\mathcal{P}}
+=
+\tau q_{\mathrm{diff}}
+\tanh
 \left(
-1+
-R_{\mathrm{NCIF}}
+\sum_j w_j I_j(\mathbf{n})
 \right).
-$$
-
-### 4.3 零初始化退化性
-
-令所有 $\mathbf{d}_i$ 和 $\mathbf{h}_{c,lm}$ 初始化为零，则：
-
-$$
-R_{\mathrm{NCIF}}=0,
 $$
 
 因此：
 
 $$
-D_{\mathrm{NCIF}}
-=
-A
-L_{\mathrm{LF}}.
-$$
-
-这说明 NCIF 在训练初期严格退化为普通低频辐照漫反射模型，不会像无约束颜色分支一样破坏已有物理分解。
-
-### 4.4 有界性
-
-由于：
-
-$$
-\tanh(x)\in[-1,1],
-$$
-
-可得：
-
-$$
-|R_{\mathrm{NCIF}}|
+\|\Delta I_{\mathcal{P}}\|_\infty
 \le
-\tau q_{\mathrm{diff}}
-\le
-\tau.
+\tau q_{\mathrm{diff}}.
 $$
 
-因此 NCIF 最多只能以 $\tau$ 的比例调制漫反射能量，无法无限吸收颜色残差。这一性质保证它是辐照残差，而不是任意外观网络。
+这一有界性使 probe 表达的是低频全局光照残差，而不是任意外观网络。
 
-### 4.5 法向梯度
+### 4.4 探针正则
 
-对法向求导：
+本文使用空间平滑、能量约束和非负约束：
 
 $$
-\frac{\partial D_{\mathrm{NCIF}}}{\partial \mathbf{n}}
+\mathcal{R}(\mathcal{P})
 =
-A
-\frac{\partial L_{\mathrm{LF}}}{\partial \mathbf{n}}
-(1+R_{\mathrm{NCIF}})
+\lambda_{\mathrm{smooth}}
+\sum_{(i,j)\in\mathcal{E}_{p}}
+\|\mathbf{c}_i-\mathbf{c}_j\|_1
 +
-A
-L_{\mathrm{LF}}
-\frac{\partial R_{\mathrm{NCIF}}}{\partial \mathbf{n}}.
+\lambda_{\mathrm{energy}}
+\left(
+\overline{I}_{\mathcal{P}}-\overline{E}_{\mathrm{LF}}
+\right)^2
++
+\lambda_{\mathrm{neg}}
+\|\min(I_{\mathcal{P}},0)\|_2^2.
+$$
+
+其中 $\mathcal{E}_{p}$ 是 probe 邻接图。该正则使探针在空间上平滑，并避免辐照能量无界漂移。
+
+### 4.5 DDGI-lite 可见性扩展
+
+完整版本可引入 DDGI 风格的可见性统计。每隔若干步，从 probe 向若干方向发射 rays，与 Gaussian 表面或提取 mesh 求交，记录 hit depth 的一阶和二阶矩：
+
+$$
+m_1(\omega)=\mathbb{E}[d],
+\quad
+m_2(\omega)=\mathbb{E}[d^2].
+$$
+
+查询时使用 Chebyshev 风格 visibility 降低漏光：
+
+$$
+V(\mathbf{x},\omega)
+=
+\mathrm{clip}
+\left(
+\frac{\sigma^2}{\sigma^2+(d-m_1)^2},
+0,1
+\right),
+$$
+
+其中 $\sigma^2=m_2-m_1^2$。该扩展用于大场景和遮挡复杂场景，但不作为首版必须实现项。
+
+---
+
+## 5. R2SF：可靠镜面因子分解
+
+### 5.1 远场环境贴图可靠性
+
+高频环境贴图只由可靠镜面证据监督：
+
+$$
+q_{\mathrm{spec}}
+=
+\rho^\alpha(1-r)^\beta
+q_{\mathrm{n}}
+q_{\mathrm{vis}}
+q_{\mathrm{photo}}.
+$$
+
+当 $\rho$ 低或 $r$ 高时，$q_{\mathrm{spec}}$ 下降，环境贴图梯度被削弱。这样可避免非反射区域把 diffuse residual 写入 envmap。
+
+实现上，R2SF 不直接压暗前向镜面颜色。否则高反射物体中的真实镜面能量会被错误削弱，导致渲染指标下降。本文采用 forward-preserving gradient gate：
+
+$$
+\tilde{S}_{\mathrm{far}}
+=
+q_{\mathrm{spec}}
+S_{\mathrm{far}}
++
+(1-q_{\mathrm{spec}})
+\mathrm{sg}(S_{\mathrm{far}}),
+$$
+
+其中 $\mathrm{sg}(\cdot)$ 表示停止梯度。由于 $\tilde{S}_{\mathrm{far}}$ 与 $S_{\mathrm{far}}$ 在前向数值上相同，该形式不会改变渲染颜色；但反向传播时，不可靠区域对高频环境贴图和镜面分支的梯度被 $q_{\mathrm{spec}}$ 缩放。
+
+### 5.2 远场和近场镜面拆分
+
+本文将镜面项写成：
+
+$$
+S
+=
+\lambda_{\mathrm{far}}S_{\mathrm{far}}
++
+\lambda_{\mathrm{near}}S_{\mathrm{near}}.
 $$
 
 其中：
 
 $$
-\frac{\partial R_{\mathrm{NCIF}}}{\partial \mathbf{n}}
+\lambda_{\mathrm{near}}
 =
-\tau q_{\mathrm{diff}}
-\left(
-1-\tanh^2(z)
-\right)
-\left(
-\bar{\mathbf{d}}
-+
-\frac{\partial H_c(\mathbf{n})}{\partial \mathbf{n}}
-\right)
-+
-\tau
-\frac{\partial q_{\mathrm{diff}}}{\partial \mathbf{n}}
-\tanh(z).
-$$
-
-该梯度为漫反射区域提供额外 photometric normal supervision。由于 $q_{\mathrm{diff}}$ 在高反射区域较小，NCIF 不会与镜面 PBR 路径竞争法向解释。
-
-### 4.6 NCIF 正则
-
-本文使用：
-
-$$
-\mathcal{L}_{\mathrm{NCIF}}
+q_{\mathrm{spec}}q_{\mathrm{local}},
+\quad
+\lambda_{\mathrm{far}}
 =
-\lambda_d
-\sum_i
-\|\mathbf{d}_i\|_2^2
-+
-\lambda_h
-\sum_c
-\|\mathbf{h}_c\|_2^2
-+
-\lambda_{\mathrm{smooth}}
-\sum_{(i,j)\in \mathcal{E}}
-w_{ij}
-\|\mathbf{d}_i-\mathbf{d}_j\|_1.
+q_{\mathrm{spec}}(1-q_{\mathrm{local}}).
 $$
 
-邻接权重 $w_{ij}$ 可由空间距离、法向相似性和颜色边缘共同决定，使辐照残差在同一表面内平滑、在材质边界处保留变化。
+$q_{\mathrm{local}}$ 可由 ray hit 是否存在、hit depth、几何置信度和 roughness 决定。镜面尖锐且命中局部表面时，近场传输占主导；粗糙或未命中局部表面时，远场环境贴图占主导。
 
 ---
 
-## 5. PCC：阶段一致连续优化
+## 6. PCC：阶段一致连续优化
 
-### 5.1 阶段分布偏移
+### 6.1 置信度软重置
 
-两阶段逆渲染中的硬切换会改变渲染函数：
-
-$$
-C_{\mathrm{init}}
-=
-F_{\mathrm{init}}(\mathcal{G},\theta_0),
-$$
-
-$$
-C_{\mathrm{defer}}
-=
-F_{\mathrm{defer}}(\mathcal{G},\theta_{\mathrm{mat}},E,L).
-$$
-
-若在切换时直接重置 $\theta_{\mathrm{mat}}$，则优化器需要在短时间内重新解释颜色、法向、材质和照明。这会导致训练指标在切换点附近下降。
-
-### 5.2 连续过渡渲染
-
-本文在阶段边界设置过渡窗口 $[t_s,t_e]$，定义：
-
-$$
-\eta_t
-=
-\mathrm{smoothstep}
-\left(
-\frac{t-t_s}{t_e-t_s}
-\right).
-$$
-
-训练渲染颜色为：
-
-$$
-C_t
-=
-(1-\eta_t)
-C_{\mathrm{init}}
-+
-\eta_t
-C_{\mathrm{defer}}.
-$$
-
-这样优化目标从初始化模型连续变形到物理延迟渲染模型，避免硬切换。
-
-### 5.3 跨阶段蒸馏
-
-使用初始化阶段的稳定预测作为 teacher：
-
-$$
-\mathcal{L}_{\mathrm{phase}}
-=
-\|C_{\mathrm{defer}}-\mathrm{sg}(C_{\mathrm{init}})\|_1
-+
-\lambda_n
-\left[
-1-
-\langle
-N_{\mathrm{defer}},
-\mathrm{sg}(N_{\mathrm{init}})
-\rangle
-\right]
-+
-\lambda_\theta
-\|\Theta_{\mathrm{defer}}-\mathrm{sg}(\Theta_{\mathrm{init}})\|_1.
-$$
-
-其中 $\Theta$ 可以包含 albedo、reflectance、roughness 和低频 irradiance。该项只在过渡窗口内使用，并随 $\eta_t$ 衰减。
-
-### 5.4 置信度软重置
-
-不再对全部高斯执行硬重置，而是定义 Gaussian 级保留系数：
+不再在 delayed rendering 阶段对所有材质执行硬重置，而是定义 Gaussian 级保留系数：
 
 $$
 q_i^{\mathrm{keep}}
@@ -592,292 +484,119 @@ $$
 $$
 \theta_i^{+}
 =
-q_i^{\mathrm{keep}}
-\theta_i^{-}
+q_i^{\mathrm{keep}}\theta_i^{-}
 +
-(1-q_i^{\mathrm{keep}})
-\theta_0.
+(1-q_i^{\mathrm{keep}})\theta_0.
 $$
 
-可靠的高斯保留已有外观和材质，不可靠的高斯重新初始化。这比全局重置更稳定，也更符合多视角优化中的置信度原则。
+可靠高斯保留已有外观和材质，不可靠高斯重新初始化。
 
----
+### 6.2 连续过渡与蒸馏
 
-## 6. CGI：置信度门控互反射
-
-### 6.1 问题
-
-互反射需要依赖几何表面、可见性和反射方向。如果 mesh 或 surfel depth 尚不稳定，ray tracing 产生的 visibility 会把几何错误转化为错误间接光。该错误随后进入 specular shading，污染 reflectance、roughness、envmap 和法向。
-
-### 6.2 门控互反射
-
-本文将互反射写为：
+在阶段边界 $[t_s,t_e]$ 定义：
 
 $$
-I_{\mathrm{CGI}}
+\eta_t
 =
-\gamma_t
-q_{\mathrm{geo}}
-q_{\mathrm{mat}}
-I_{\mathrm{ind}},
-$$
-
-其中 $\gamma_t$ 是全局渐进权重：
-
-$$
-\gamma_t
-=
-\mathrm{clip}
+\mathrm{smoothstep}
 \left(
-\frac{t-t_{\mathrm{ind}}}{T_{\mathrm{ramp}}},
-0,
-1
+\frac{t-t_s}{t_e-t_s}
 \right).
 $$
 
-几何置信度：
+训练渲染为：
 
 $$
-q_{\mathrm{geo}}
+C_t
 =
-q_{\mathrm{n}}
-q_{\mathrm{depth}}
-q_{\mathrm{vis}}
-q_{\mathrm{mesh}}.
-$$
-
-材质置信度：
-
-$$
-q_{\mathrm{mat}}
-=
-\rho^\alpha
-\cdot
-(1-r)^\beta
-\cdot
-q_{\mathrm{photo}}.
-$$
-
-只有高反射、低粗糙、几何稳定且 residual 合理的区域才强启用互反射。对于非反射区域，互反射自然衰减，不再干扰漫反射重建。
-
-### 6.3 间接光一致性正则
-
-为避免间接光突变，加入：
-
-$$
-\mathcal{L}_{\mathrm{ind}}
-=
-\lambda_{\mathrm{ind\_smooth}}
-\|\nabla I_{\mathrm{CGI}}\|_1
+(1-\eta_t)C_{\mathrm{init}}
 +
-\lambda_{\mathrm{ind\_energy}}
-\|\max(I_{\mathrm{CGI}}-\xi S_{\mathrm{direct}},0)\|_2^2.
+\eta_t C_{\mathrm{phys}}.
 $$
 
-第一项抑制局部噪声，第二项限制间接光相对直接光的能量，避免错误 mesh 产生过强补偿。
+同时使用初始化阶段输出作为 teacher：
+
+$$
+\mathcal{L}_{\mathrm{phase}}
+=
+\|C_{\mathrm{phys}}-\mathrm{sg}(C_{\mathrm{init}})\|_1
++
+\lambda_n
+\left[
+1-\langle N_{\mathrm{phys}},\mathrm{sg}(N_{\mathrm{init}})\rangle
+\right]
++
+\lambda_{\theta}
+\|\Theta_{\mathrm{phys}}-\mathrm{sg}(\Theta_{\mathrm{init}})\|_1.
+$$
+
+该项只在过渡窗口内使用，并随训练逐渐衰减。
 
 ---
 
-## 7. 大规模真实场景外观校准
+## 7. 总体优化目标
 
-真实开放场景中的低指标通常不仅来自反射模型，还来自曝光、白平衡、背景、动态物体和尺度变化。本文引入轻量外观校准：
+整体目标为：
 
 $$
-\hat{I}_v
+\mathcal{L}
 =
-\mathbf{a}_v
-\odot
-I_v
-+
-\mathbf{b}_v,
-$$
-
-其中 $\mathbf{a}_v$ 和 $\mathbf{b}_v$ 是每张训练图的颜色仿射参数，并加入弱正则：
-
-$$
-\mathcal{L}_{\mathrm{exp}}
-=
-\|\mathbf{a}_v-\mathbf{1}\|_2^2
-+
-\|\mathbf{b}_v\|_2^2.
-$$
-
-背景和天空区域不应监督前景材质与环境贴图，因此定义背景门控 $q_{\mathrm{fg}}$：
-
-$$
 \mathcal{L}_{\mathrm{rgb}}
-=
-\rho_{\mathrm{robust}}
-\left(
-q_{\mathrm{fg}}
-(C-\hat{I})
-\right).
++
+\lambda_{\mathrm{geo}}\mathcal{L}_{\mathrm{geo}}
++
+\lambda_E\mathcal{L}_E
++
+\lambda_{\mathcal{P}}\mathcal{L}_{\mathcal{P}}
++
+\lambda_{\mathrm{phase}}\mathcal{L}_{\mathrm{phase}}
++
+\lambda_{\mathrm{local}}\mathcal{L}_{\mathrm{local}}.
 $$
 
-其中 $\rho_{\mathrm{robust}}$ 可取 Charbonnier 或 Huber loss，以降低高光异常、遮挡和动态误差对材质分解的影响。
+其中：
+
+- $\mathcal{L}_{\mathrm{rgb}}$ 是 photometric reconstruction loss。
+- $\mathcal{L}_{\mathrm{geo}}$ 包含法向、深度或 smoothness 正则。
+- $\mathcal{L}_{E}$ 约束远场环境贴图。
+- $\mathcal{L}_{\mathcal{P}}$ 约束探针辐照场。
+- $\mathcal{L}_{\mathrm{phase}}$ 稳定阶段切换。
+- $\mathcal{L}_{\mathrm{local}}$ 约束局部 ray-traced transport 的能量和置信度。
 
 ---
 
-## 8. 总体训练流程
+## 8. 分阶段实现策略
 
-本文采用如下统一训练协议：
+本文方法可以分阶段落地，避免一次性实现完整 DDGI 导致不可控：
 
-1. **几何与初始外观阶段**。使用稳定的高斯级着色优化几何、基础颜色、透明度与初始法向。
-2. **PCC 过渡阶段**。在 $[t_s,t_e]$ 内同时计算初始化渲染和延迟物理渲染，通过连续权重 $\eta_t$ 与跨阶段蒸馏平滑迁移。
-3. **R2IF 解耦照明阶段**。低频辐照场持续优化，高频环境贴图仅由高 $q_{\mathrm{spec}}$ 的可靠镜面证据监督。
-4. **NCIF 法向耦合阶段**。在低反射和高粗糙区域逐步启用 NCIF residual，为漫反射法向提供 photometric gradient。
-5. **CGI 互反射阶段**。在几何和材质置信度足够时逐步启用局部互反射。
-6. **真实场景增强阶段**。对 Ref-Real 或大规模真实场景启用曝光校准、背景门控和空间低频辐照 cell。
-
----
-
-## 9. 当前工程落地状态与测试计划
-
-本节用于区分论文中的完整理论方案与当前工程已经实现的首版模块。当前实现遵循一个原则：保留 Ref-Gaussian 的主体渲染链路和材质参数体系，在其 surfel / volume 渲染路径上增量加入可靠性门控、NCIF 辐照残差、互反射门控和阶段切换稳定化。未完成的部分不会在实验结论中被默认视为已实现贡献。
-
-### 9.1 当前已落地内容
-
-- [x] **Ref-Gaussian 主链路保留**：保留反射强度、金属度、粗糙度、环境贴图、surfel 渲染、volume 渲染、delayed rendering 和 mesh-based indirect rendering 的主体流程。
-- [x] **旧 IDIV 命名清理**：工程内旧 `idiv`、`eval_indirect`、`no_eval_indirect` 参数已从主训练与评估路径中移除，统一替换为 NCIF 语义。
-- [x] **Per-Gaussian NCIF 向量**：每个 Gaussian 维护零初始化的 3D NCIF 辐照残差向量，并进入优化器、densification、pruning、PLY 保存与读取流程。
-- [x] **NCIF 有界漫反射调制**：NCIF 通过 splatting 聚合到像素后，以 $\tanh(\mathbf{n}^{\top}\mathbf{d})$ 的有界响应调制 diffuse 分量，并使用 ramp 权重逐步启用。
-- [x] **NCIF 漫反射责任门控**：当前实现使用反射强度和粗糙度构造 $q_{\mathrm{diff}}=(1-\rho)^\mu r^\nu$，使 NCIF 更偏向低反射、高粗糙区域。
-- [x] **NCIF 正则首版**：已加入 NCIF map 平滑正则和 NCIF magnitude 正则，限制残差过度吸收颜色。
-- [x] **R2IF 首版镜面可靠性门控**：当前实现使用反射强度和粗糙度构造 $q_{\mathrm{spec}}=\rho^\alpha(1-r)^\beta$，并在 surfel / volume 路径中调制 specular 强度。
-- [x] **环境贴图稳定正则**：已加入环境贴图 TV 正则和双环境贴图能量一致性正则，以缓解低反射场景中 envmap 噪声化。
-- [x] **CGI 首版互反射门控**：间接光不再由固定迭代后全量启用，而是结合训练 ramp 和镜面可靠性 gate 控制 indirect light 对 specular 的贡献。
-- [x] **PCC 软重置首版**：阶段切换时可使用 soft reset 保留一部分已有材质与颜色，而不是完全硬重置所有材质属性。
-- [x] **训练脚本统一**：`train.sh` 已统一到当前 NCIF/R2IF/PCC/CGI 参数体系，并保留部分官方稳定参数。
-- [x] **中文 README**：README 已改写为中文，说明核心模块、训练命令、评估开关和参数含义。
-
-### 9.2 当前尚未完整落地内容
-
-- [ ] **完整 R2IF 可观测性估计**：当前 R2IF 只使用反射强度和粗糙度，尚未加入法向一致性 $q_{\mathrm{n}}$、可见性 $q_{\mathrm{vis}}$、photometric residual $q_{\mathrm{photo}}$ 和显式高频 envmap 梯度屏蔽。
-- [ ] **低频空间辐照 cell / SH 场**：当前 NCIF 只实现 per-Gaussian 局部残差，尚未实现空间 cell 级低频方向辐照场。
-- [ ] **完整 PCC 连续过渡渲染**：当前 PCC 是 soft reset 首版，尚未实现初始化渲染与 PBR 渲染的连续混合、RGB 蒸馏、法向蒸馏和材质蒸馏。
-- [ ] **完整 CGI 几何置信度**：当前 CGI 使用训练 ramp 与反射可靠性门控，尚未加入 mesh 置信度、depth consistency、visibility consistency 和 indirect energy 正则。
-- [ ] **真实场景外观校准**：尚未实现 per-image exposure / white-balance 仿射校准、背景门控和 robust photometric loss。
-- [ ] **自动化实验汇总**：尚未实现面向 18k/20k/22k/30k/50k 的自动曲线对比、envmap 可视化汇总和模块消融表格生成。
-
-### 9.3 创新点逐步落地测试流程
-
-为了避免一次性叠加多个模块导致无法判断收益来源，实验应按照从稳定性到完整性的顺序推进。
-
-**Step 0：Ref-Gaussian 复现基线。**
-
-目标是确认当前清理后的工程仍能复现 Ref-Gaussian 主链路。训练时关闭所有新模块和新增正则：
-
-$$
-\texttt{--no\_use\_ncif --no\_use\_r2if --no\_use\_pcc --no\_use\_cgi --lambda\_env\_tv 0 --lambda\_env\_energy 0}
-$$
-
-优先测试已有突降嫌疑场景，例如 Bell、Toaster、Lego、Mic，并记录 18k、20k、22k、30k、50k 的 PSNR、SSIM、LPIPS、法向图、材质图和 envmap。
-
-**Step 1：只测试 PCC 软重置。**
-
-目标是验证 20k 附近指标突降是否主要来自硬重置和阶段切换。仅开启 PCC，关闭 R2IF、NCIF、CGI：
-
-$$
-\texttt{--use\_pcc --no\_use\_ncif --no\_use\_r2if --no\_use\_cgi --lambda\_env\_tv 0 --lambda\_env\_energy 0}
-$$
-
-若 20k 后 PSNR 曲线更平滑、30k 相比 baseline 回升，则说明阶段切换稳定化有效。此阶段重点调 `pcc_keep_ratio`，建议从 0.5、0.75、0.9 三档测试。
-
-**Step 2：测试 R2IF 与环境贴图稳定正则。**
-
-目标是验证低反射和高粗糙区域不应强监督高频 envmap。开启 R2IF 和 envmap 正则，仍关闭 NCIF 与 CGI：
-
-$$
-\texttt{--use\_pcc --use\_r2if --no\_use\_ncif --no\_use\_cgi}
-$$
-
-重点观察 NeRF Synthetic、Ref-Real 和低反射物体的 envmap 是否从彩色噪声变得更平滑，PSNR 是否至少不低于 baseline，LPIPS 是否改善。此阶段调 `r2if_specular_alpha`、`r2if_specular_beta`、`r2if_min_specular_gate`、`lambda_env_tv`。
-
-**Step 3：测试 CGI 互反射门控。**
-
-目标是验证间接光只在可靠镜面区域启用是否能减少错误 mesh feedback。开启 PCC、R2IF、CGI，关闭 NCIF：
-
-$$
-\texttt{--use\_pcc --use\_r2if --use\_cgi --no\_use\_ncif}
-$$
-
-优先测试高反射且存在互反射的场景，例如 Bell、Tbell、Teapot、Toaster。若 specular 边界更稳定、反射区域 LPIPS 改善，同时非反射区域不被间接光污染，则保留该模块。
-
-**Step 4：测试 NCIF 漫反射法向耦合。**
-
-目标是验证 NCIF 是否能提升低反射/漫反射区域的颜色和几何。开启 PCC、R2IF、NCIF，先关闭 CGI：
-
-$$
-\texttt{--use\_pcc --use\_r2if --use\_ncif --no\_use\_cgi}
-$$
-
-优先测试 NeRF Synthetic 中 Chair、Ficus、Hotdog、Ship，以及 Ref-Real 中 Gardenspheres、Toycar、Sedan。需要同时保存 `ncif_map`、`ncif_response`、`ncif_responsibility` 与法向图，确认 NCIF 只在 diffuse-dominant 区域工作，没有吸收镜面高光。
-
-**Step 5：完整 PhysNorm-GS。**
-
-目标是验证 PCC、R2IF、CGI、NCIF 共同作用后的最终性能。使用 `train.sh` 当前完整命令训练全数据集，并与 Step 0 基线、Ref-Gaussian 30k/50k、当前第一轮实验结果对比。
-
-**Step 6：决定第二轮实现方向。**
-
-若 Step 1 收益最大，则优先实现完整 PCC 蒸馏；若 Step 2 对 envmap 改善明显但指标不足，则优先实现空间低频 irradiance cell；若 Step 4 在 NeRF Synthetic 和 Ref-Real 有收益，则继续强化 NCIF 的多尺度低频辐照场；若 CGI 在部分场景负收益，则将其改为仅高可靠场景启用或加入更严格的 geometry confidence。
+1. **GIP-0：Per-Gaussian Irradiance Proxy。** 使用每个 Gaussian 的有界低频辐照残差作为探针代理，验证漫反射区域监督低频辐照是否有效。
+2. **GIP-1：Learnable Grid Irradiance Probes。** 在场景 bbox 中放置规则 probe grid，使用 SH2/SH3 表示方向辐照，trilinear interpolation 查询。
+3. **GIP-2：Gaussian-aware Adaptive Probes。** 根据 Gaussian 密度、可见性和场景尺度自适应布置 probes，提高大场景效率。
+4. **GIP-3：DDGI-lite Visibility。** 利用已有 ray tracing 计算 probe visibility moments，缓解漏光和遮挡错误。
+5. **Full RAP-GI。** 联合远场 envmap、近场 ray tracing 和 probe irradiance，形成完整混合反射全局光照逆渲染框架。
 
 ---
 
-## 10. 消融实验设计
+## 9. 与相关工作的关系
 
-为了证明各模块有效性，本文设计如下消融：
+传统 irradiance volume、light probes 和 DDGI 证明了空间探针适合表达低频漫反射全局光照。本文不是将其直接用于前向渲染，而是将 probe 作为逆渲染中的可学习物理因子，并用材质可观测性控制其梯度来源。
 
-| 设置 | 目的 | 预期现象 |
-| --- | --- | --- |
-| w/o R2IF | 验证可靠环境贴图优化 | 非反射场景 envmap 噪声增强，PSNR/LPIPS 下降 |
-| w/o NCIF | 验证漫反射法向梯度 | NeRF Synthetic 与 Ref-Real 中漫反射区域法向和颜色下降 |
-| w/o PCC | 验证阶段切换稳定性 | 18k-20k 附近更容易出现指标突降 |
-| hard reset | 验证软重置必要性 | 材质重新收敛慢，部分场景后期退化 |
-| w/o CGI | 验证互反射门控 | 高反射局部区域间接光错误，反射边界模糊 |
-| global envmap only | 验证低频辐照分解 | 非反射和真实场景环境贴图混乱 |
-| no exposure calibration | 验证真实图像外观校准 | Ref-Real 指标下降，材质颜色漂移 |
-| NCIF without bound | 验证有界残差 | residual 吸收颜色，材质可解释性下降 |
+基于 PBR 的高斯逆渲染和反射高斯方法通常强调环境贴图、BRDF 和 ray tracing 的联合优化。本文指出：环境贴图只适合可靠镜面证据，漫反射区域应监督空间辐照探针，近场反射应交给局部 ray-traced transport。该分解避免单一 envmap 同时解释背景、物体反射和漫反射残差。
 
-关键可视化包括：
-
-- 高频环境贴图 $E_{\mathrm{HF}}$。
-- 低频辐照 cell。
-- $q_{\mathrm{spec}}$ 可靠反射图。
-- $q_{\mathrm{diff}}$ 漫反射责任图。
-- NCIF residual response。
-- CGI visibility 和 indirect map。
-- 18k-25k 训练曲线与阶段切换前后材质图。
+本文与一般 appearance MLP 或颜色残差网络的区别在于：MGIP 是低阶方向辐照场，具有空间平滑、有界响应、材质责任门控和物理可解释性，不是任意外观拟合分支。
 
 ---
 
-## 11. 与相关思想的关系
+## 10. 预期优势
 
-本文借鉴三类成熟思想，但方法目标和组合方式不同。
-
-首先，deferred inverse rendering 和基于 BRDF 的环境光查询为反射重建提供了物理基础。然而，本文指出高频环境贴图并非在所有区域都可观测，因此提出 R2IF，以反射可靠性决定高频照明监督。
-
-其次，surface-aligned Gaussian primitives 能缓解 3D Gaussian 的多视角几何不一致。本文进一步将其 normal-depth consistency 用作可靠性估计，参与照明、材质、重置和互反射的责任分配。
-
-第三，传统图形学中的 continuation optimization、trust-region、球谐低频照明、鲁棒 photometric loss、曝光校准和尺度感知过滤，为大规模真实场景提供了稳定优化原则。本文将这些原则嵌入 Gaussian 逆渲染流程，形成统一的可靠性驱动物理优化框架。
-
-本文不将某个已有模块直接作为主贡献，而是围绕一个统一问题展开：**在混合反射场景中，不同物理因子的可观测性高度不均衡，因此必须用可靠性来决定照明、法向、材质和互反射各自应承担的解释责任。**
+1. **非反射场景更稳。** 漫反射区域主要优化低频 probe irradiance，避免污染高频 envmap。
+2. **反射场景更准。** 远场 envmap 与近场 ray-traced transport 分工明确，降低背景和局部物体反射冲突。
+3. **真实大场景更适配。** 空间 probes 可表达局部照明变化，优于单个全局环境贴图。
+4. **训练更稳定。** PCC 缓解 delayed rendering 阶段切换和材质重置导致的后期退化。
+5. **创新主线更统一。** R2SF、MGIP、local ray tracing 和 PCC 都服务于同一命题：根据材质可观测性分配全局光照解释责任。
 
 ---
 
-## 12. 预期优势
+## 11. 最终论文叙事摘要
 
-PhysNorm-GS 的优势可以概括为：
-
-1. **反射场景更稳定**。R2IF 和 CGI 保留镜面 PBR 与互反射优势，同时避免错误间接光污染。
-2. **非反射场景更鲁棒**。低频辐照与 NCIF 避免高频环境贴图在低反射场景中退化为噪声。
-3. **阶段训练更平滑**。PCC 缓解硬重置和渲染器切换造成的指标突降。
-4. **大规模真实场景更适配**。空间辐照 cell、曝光校准和背景门控提高真实图像下的 photometric 稳定性。
-5. **物理可解释性更强**。NCIF 有零初始化、有界响应和材质门控，不是任意颜色网络。
-
----
-
-## 13. 最终论文叙事摘要
-
-本文的最终叙事可概括为：
-
-> 混合反射场景中的高斯逆渲染并非单纯的外观拟合问题，而是一个物理因子可观测性不均衡的问题。高反射区域可以监督镜面环境光和法向，低反射区域则缺乏可靠的高频环境光梯度，真实大场景还伴随曝光和空间照明变化。PhysNorm-GS 通过可靠反射引导照明因子分解、法向耦合辐照场、阶段一致连续优化和置信度门控互反射，将照明、材质、几何与间接光的解释责任显式分配到最可靠的观测区域，从而统一提升反射与非反射场景中的几何和渲染质量。
+混合反射 Gaussian 逆渲染的核心困难并非材质参数不足，而是不同材质区域对不同光照因子的可观测性不同。高反射低粗糙区域能监督高频远场环境和近场镜面传输；漫反射和粗糙区域更适合监督空间低频全局辐照；真实大场景还需要处理局部照明变化与阶段优化不稳定。PhysNorm-GS 通过反射感知探针全局光照分解，将远场环境贴图、近场 ray-traced transport 和 Gaussian irradiance probes 统一到一个材质责任驱动的逆渲染框架中，从而减少环境贴图污染，提升混合反射场景的几何、材质和渲染质量。

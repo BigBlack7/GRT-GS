@@ -52,6 +52,15 @@ def _specular_reliability(refl_strength, roughness, opt=None):
     return gate.clamp(0.0, 1.0)
 
 
+def _apply_specular_reliability(specular, reliability, opt=None):
+    if opt is not None and not getattr(opt, "use_r2if", True):
+        return specular
+    if opt is not None and getattr(opt, "r2if_gate_render", False):
+        return specular * reliability
+    reliability = reliability.detach()
+    return specular * reliability + specular.detach() * (1.0 - reliability)
+
+
 def _cgi_gate(refl_strength, roughness, opt=None):
     if opt is not None and not getattr(opt, "use_cgi", True):
         return torch.ones_like(refl_strength)
@@ -397,7 +406,7 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     else:
         specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth)
     specular_reliability = _specular_reliability(refl_strength, roughness, opt)
-    specular = specular * specular_reliability
+    specular = _apply_specular_reliability(specular, specular_reliability, opt)
 
     # Integrate the final image
     diffuse_color = (1.0 - material_gate).clamp(0.0, 1.0) * base_color
@@ -573,7 +582,8 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     else: 
         material_gate = _material_gate(refl, opt)
         diffuse, specular = get_full_color_volume(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness)
-    specular = specular * _specular_reliability(refl, roughness, opt)
+    specular_reliability = _specular_reliability(refl, roughness, opt)
+    specular = _apply_specular_reliability(specular, specular_reliability, opt)
     colors_precomp = specular + diffuse
 
 
