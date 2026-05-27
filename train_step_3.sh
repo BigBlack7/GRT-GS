@@ -19,7 +19,9 @@ OUT_ROOT=${OUT_ROOT:-/data2/zmh/output_physnorm_steps}
 STEP_ITERS=${STEP_ITERS:-50000}
 PCC_KEEP=${PCC_KEEP:-0.65}
 PCC_TAG=${PCC_KEEP/./}
-STEP_NAME=${STEP_NAME:-step3_cgi_debug_${STEP_ITERS}_pcc${PCC_TAG}}
+R2SF_MIN_GATE=${R2SF_MIN_GATE:-0.15}
+MIN_TAG=${R2SF_MIN_GATE/./}
+STEP_NAME=${STEP_NAME:-step3_cgi_debug_${STEP_ITERS}_pcc${PCC_TAG}_mingate${MIN_TAG}}
 OUT_DIR="$OUT_ROOT/$STEP_NAME"
 
 eval_synth() {
@@ -33,7 +35,7 @@ else
 fi
 
 SYNTH_EVAL="--eval --white_background"
-CGI_DEFAULT="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_cgi --no_use_ncif --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --cgi_ramp_iters 5000 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate 0.02"
+CGI_DEFAULT="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_cgi --no_use_ncif --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --cgi_ramp_iters 5000 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate $R2SF_MIN_GATE"
 CGI_STRICT="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_cgi --no_use_ncif --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --cgi_ramp_iters 15000 --r2if_specular_alpha 2.0 --r2if_specular_beta 2.0 --r2if_min_specular_gate 0.00"
 
 run_synth() {

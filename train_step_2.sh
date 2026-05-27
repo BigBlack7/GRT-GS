@@ -4,12 +4,12 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -e
 
-# Step 2: R2SF/R2IF + environment-map regularization.
+# Step 2: OAH-GS far-field specular branch.
 #
 # Purpose:
-#   Test whether reliable far-field specular gating and envmap TV/energy
-#   regularization reduce noisy environment maps in weakly reflective and
-#   real scenes. This is the far-field branch of RAP-GI.
+#   Test whether observability-aware far-field specular supervision and
+#   envmap TV/energy regularization reduce noisy environment maps without
+#   hurting weakly reflective and real scenes.
 #
 # This script uses one global PCC keep ratio for all scenes. After Step 1,
 # override PCC_KEEP if the sweep shows a better global value.
@@ -23,7 +23,9 @@ OUT_ROOT=${OUT_ROOT:-/data2/zmh/output_physnorm_steps}
 STEP_ITERS=${STEP_ITERS:-30000}
 PCC_KEEP=${PCC_KEEP:-0.65}
 PCC_TAG=${PCC_KEEP/./}
-STEP_NAME=${STEP_NAME:-step2_r2if_env_${STEP_ITERS}_pcc${PCC_TAG}}
+R2SF_MIN_GATE=${R2SF_MIN_GATE:-0.15}
+MIN_TAG=${R2SF_MIN_GATE/./}
+STEP_NAME=${STEP_NAME:-step2_oah_r2sf_envgate_${STEP_ITERS}_pcc${PCC_TAG}_mingate${MIN_TAG}}
 OUT_DIR="$OUT_ROOT/$STEP_NAME"
 
 eval_synth() {
@@ -42,7 +44,7 @@ fi
 
 SYNTH_EVAL="--eval --white_background"
 CHECK_REAL="--test_iterations 10000 15000 18000 20000 --save_iterations 10000 15000 18000 20000"
-R2IF_ENV="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --no_use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate 0.02"
+R2IF_ENV="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --no_use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate $R2SF_MIN_GATE"
 
 run_synth() {
   local source_path="$1"

@@ -4,11 +4,11 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -e
 
-# Step 4 fix check: GIP-0 / NCIF with fixed R2SF gradient-only gate.
+# Step 4 fix check: OAH-GS GIP-0 / NCIF with R2SF env-light-only gate.
 #
 # Purpose:
-#   Re-test the current per-Gaussian irradiance proxy after the far-field
-#   specular branch no longer dims forward specular color.
+#   Re-test the current per-Gaussian irradiance proxy after moving the
+#   far-field specular gate to the envmap light query only.
 #
 # Run after train_step_2_fix.sh:
 #   bash train_step_4_fix.sh
@@ -17,7 +17,9 @@ OUT_ROOT=${OUT_ROOT:-/data2/zmh/output_physnorm_steps}
 STEP_ITERS=${STEP_ITERS:-30000}
 PCC_KEEP=${PCC_KEEP:-0.65}
 PCC_TAG=${PCC_KEEP/./}
-STEP_NAME=${STEP_NAME:-step4_gip0_gradfix_${STEP_ITERS}_pcc${PCC_TAG}}
+R2SF_MIN_GATE=${R2SF_MIN_GATE:-0.15}
+MIN_TAG=${R2SF_MIN_GATE/./}
+STEP_NAME=${STEP_NAME:-step4_gip0_envgate_${STEP_ITERS}_pcc${PCC_TAG}_mingate${MIN_TAG}}
 OUT_DIR="$OUT_ROOT/$STEP_NAME"
 
 eval_synth() {
@@ -31,7 +33,7 @@ eval_real() {
 SYNTH_EVAL="--eval --white_background"
 CHECK_SYNTH="--iterations $STEP_ITERS --test_iterations 18000 20000 22000 25000 26000 27000 28000 30000 --save_iterations 18000 20000 22000 25000 26000 27000 28000 30000"
 CHECK_REAL="--test_iterations 10000 12000 15000 18000 20000 --save_iterations 10000 12000 15000 18000 20000"
-GIP0_COMMON="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate 0.02"
+GIP0_COMMON="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate $R2SF_MIN_GATE"
 GIP0_STRONG="--ncif_from_iter 2000 --ncif_tau 0.25 --ncif_ramp_iters 4000 --lambda_ncif_smooth 0.005 --lambda_ncif_magnitude 0.001"
 GIP0_MEDIUM="--ncif_from_iter 3000 --ncif_tau 0.15 --ncif_ramp_iters 5000 --lambda_ncif_smooth 0.003 --lambda_ncif_magnitude 0.001"
 GIP0_WEAK="--ncif_from_iter 8000 --ncif_tau 0.06 --ncif_ramp_iters 5000 --lambda_ncif_smooth 0.001 --lambda_ncif_magnitude 0.001"

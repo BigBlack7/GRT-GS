@@ -57,8 +57,7 @@ def _apply_specular_reliability(specular, reliability, opt=None):
         return specular
     if opt is not None and getattr(opt, "r2if_gate_render", False):
         return specular * reliability
-    reliability = reliability.detach()
-    return specular * reliability + specular.detach() * (1.0 - reliability)
+    return specular
 
 
 def _cgi_gate(refl_strength, roughness, opt=None):
@@ -399,13 +398,16 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     normal_map = render_normal.permute(1,2,0)
     normal_map = normal_map / render_alpha.permute(1,2,0).clamp_min(1e-6)
     normal_map_chw = F.normalize(normal_map.permute(2,0,1), dim=0, eps=1e-6)
+    specular_reliability = _specular_reliability(refl_strength, roughness, opt)
+    env_grad_gate = None
+    if getattr(opt, "use_r2if", True):
+        env_grad_gate = specular_reliability.permute(1, 2, 0)
     
     if opt.indirect:
         indirect_gate = _cgi_gate(refl_strength, roughness, opt)
-        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth, indirect_light=indirect_light.permute(1,2,0), indirect_gate=indirect_gate.permute(1,2,0))
+        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth, indirect_light=indirect_light.permute(1,2,0), indirect_gate=indirect_gate.permute(1,2,0), env_grad_gate=env_grad_gate)
     else:
-        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth)
-    specular_reliability = _specular_reliability(refl_strength, roughness, opt)
+        specular, extra_dict = get_specular_color_surfel(pc.get_envmap, albedo.permute(1,2,0), viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normal_map, render_alpha.permute(1,2,0), refl_strength=refl_strength.permute(1,2,0), roughness=roughness.permute(1,2,0), pc=pc, surf_depth=surf_depth, env_grad_gate=env_grad_gate)
     specular = _apply_specular_reliability(specular, specular_reliability, opt)
 
     # Integrate the final image
@@ -573,16 +575,19 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         shs_indirect = pc.get_indirect.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
         sh2indirect = eval_sh(3, shs_indirect, reflection)
         indirect = torch.clamp_min(sh2indirect, 0.0)
+    specular_reliability = _specular_reliability(refl, roughness, opt)
+    env_grad_gate = None
+    if getattr(opt, "use_r2if", True):
+        env_grad_gate = specular_reliability
     if opt.indirect:
         material_gate = _material_gate(refl, opt)
         indirect_gate = _cgi_gate(refl, roughness, opt)
-        diffuse, specular, extra = get_full_color_volume_indirect(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness, pc=pc, indirect_light=indirect, indirect_gate=indirect_gate)
+        diffuse, specular, extra = get_full_color_volume_indirect(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness, pc=pc, indirect_light=indirect, indirect_gate=indirect_gate, env_grad_gate=env_grad_gate)
         visibility = extra['visibility']
         direct_light = extra["direct_light"]
     else: 
         material_gate = _material_gate(refl, opt)
-        diffuse, specular = get_full_color_volume(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness)
-    specular_reliability = _specular_reliability(refl, roughness, opt)
+        diffuse, specular = get_full_color_volume(pc.get_envmap_2, means3D, ori_color, viewpoint_camera.HWK, viewpoint_camera.R, viewpoint_camera.T, normals.contiguous(), opacity, refl_strength=refl, roughness=roughness, env_grad_gate=env_grad_gate)
     specular = _apply_specular_reliability(specular, specular_reliability, opt)
     colors_precomp = specular + diffuse
 

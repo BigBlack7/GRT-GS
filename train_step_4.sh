@@ -4,13 +4,13 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -e
 
-# Step 4: GIP-0 / NCIF irradiance proxy test.
+# Step 4: OAH-GS diffuse low-frequency branch proxy.
 #
 # Purpose:
 #   Test the current per-Gaussian NCIF residual as GIP-0, a minimal proxy for
 #   probe-based diffuse irradiance. This is still not the final grid-probe
-#   RAP-GI implementation, but it tells us whether low-frequency diffuse
-#   irradiance helps before we implement true spatial probes.
+#   implementation, but it tells us whether low-frequency diffuse correction
+#   helps before we implement true spatial probes.
 #
 # Run this after Step 1 and Step 2. Override PCC_KEEP according to the Step 1
 # sweep if needed.
@@ -23,7 +23,9 @@ OUT_ROOT=${OUT_ROOT:-/data2/zmh/output_physnorm_steps}
 STEP_ITERS=${STEP_ITERS:-30000}
 PCC_KEEP=${PCC_KEEP:-0.65}
 PCC_TAG=${PCC_KEEP/./}
-STEP_NAME=${STEP_NAME:-step4_gip0_ncif_${STEP_ITERS}_pcc${PCC_TAG}}
+R2SF_MIN_GATE=${R2SF_MIN_GATE:-0.15}
+MIN_TAG=${R2SF_MIN_GATE/./}
+STEP_NAME=${STEP_NAME:-step4_oah_gip0_envgate_${STEP_ITERS}_pcc${PCC_TAG}_mingate${MIN_TAG}}
 OUT_DIR="$OUT_ROOT/$STEP_NAME"
 
 eval_synth() {
@@ -42,7 +44,7 @@ fi
 
 SYNTH_EVAL="--eval --white_background"
 CHECK_REAL="--test_iterations 10000 15000 18000 20000 --save_iterations 10000 15000 18000 20000"
-NCIF_COMMON="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate 0.02"
+NCIF_COMMON="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate $R2SF_MIN_GATE"
 NCIF_STRONG="--ncif_from_iter 2000 --ncif_tau 0.25 --ncif_ramp_iters 4000 --lambda_ncif_smooth 0.005 --lambda_ncif_magnitude 0.001"
 NCIF_MEDIUM="--ncif_from_iter 3000 --ncif_tau 0.15 --ncif_ramp_iters 5000 --lambda_ncif_smooth 0.003 --lambda_ncif_magnitude 0.001"
 NCIF_WEAK="--ncif_from_iter 8000 --ncif_tau 0.06 --ncif_ramp_iters 5000 --lambda_ncif_smooth 0.001 --lambda_ncif_magnitude 0.001"

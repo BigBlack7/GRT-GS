@@ -105,10 +105,15 @@ def reflection(w_o, normal):
     return w_k, NdotV
 
 
+def apply_gradient_gate(value, gate):
+    if gate is None:
+        return value
+    gate = gate.detach()
+    return value * gate + value.detach() * (1.0 - gate)
 
 
 
-def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, surf_depth=None, indirect_light=None, indirect_gate=None): #RT W2C
+def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, surf_depth=None, indirect_light=None, indirect_gate=None, env_grad_gate=None): #RT W2C
     global FG_LUT
     H,W,K = HWK
     rays_cam, rays_o = sample_camera_rays(HWK, R, T)
@@ -121,7 +126,7 @@ def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_ma
     fg_lut = _get_fg_lut(fg_uv.device)
     fg = dr.texture(fg_lut, fg_uv.reshape(1, -1, 1, 2).contiguous(), filter_mode="linear", boundary_mode="clamp").reshape(1, H, W, 2)
     # Compute direct light
-    direct_light = envmap(rays_refl, roughness=roughness)
+    direct_light = apply_gradient_gate(envmap(rays_refl, roughness=roughness), env_grad_gate)
     specular_weight = ((0.04 * (1 - refl_strength) + albedo * refl_strength) * fg[0][..., 0:1] + fg[0][..., 1:2]) 
     
     # visibility
@@ -168,7 +173,7 @@ def get_specular_color_surfel(envmap: torch.Tensor, albedo, HWK, R, T, normal_ma
 
 
 
-def get_full_color_volume(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None): #RT W2C
+def get_full_color_volume(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, env_grad_gate=None): #RT W2C
     global FG_LUT
     _, rays_o = sample_camera_rays(HWK, R, T)
     N, _ = normal_map.shape
@@ -186,14 +191,15 @@ def get_full_color_volume(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_m
     # Compute diffuse
     diffuse = envmap(normal_map, mode="diffuse") * (1-refl_strength) * albedo
     # Compute specular
-    specular = envmap(rays_refl, roughness=roughness) * ((0.04 * (1 - refl_strength) + albedo * refl_strength) * fg[0][..., 0:1] + fg[0][..., 1:2]) 
+    specular_light = apply_gradient_gate(envmap(rays_refl, roughness=roughness), env_grad_gate)
+    specular = specular_light * ((0.04 * (1 - refl_strength) + albedo * refl_strength) * fg[0][..., 0:1] + fg[0][..., 1:2]) 
 
     return diffuse, specular
 
 
 
 
-def get_full_color_volume_indirect(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, indirect_light=None, indirect_gate=None): #RT W2C
+def get_full_color_volume_indirect(envmap: torch.Tensor, xyz, albedo, HWK, R, T, normal_map, render_alpha, scaling_modifier = 1.0, refl_strength = None, roughness = None, pc=None, indirect_light=None, indirect_gate=None, env_grad_gate=None): #RT W2C
     global FG_LUT
     _, rays_o = sample_camera_rays(HWK, R, T)
     N, _ = normal_map.shape
@@ -218,7 +224,7 @@ def get_full_color_volume_indirect(envmap: torch.Tensor, xyz, albedo, HWK, R, T,
     # Compute diffuse
     diffuse = envmap(normal_map, mode="diffuse") * (1-refl_strength) * albedo
     # Compute specular
-    direct_light = envmap(rays_refl, roughness=roughness) 
+    direct_light = apply_gradient_gate(envmap(rays_refl, roughness=roughness), env_grad_gate) 
     specular_weight = ((0.04 * (1 - refl_strength) + albedo * refl_strength) * fg[0][..., 0:1] + fg[0][..., 1:2]) 
     if indirect_gate is None:
         indirect_gate = torch.ones_like(visibility)

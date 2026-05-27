@@ -4,12 +4,13 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -e
 
-# Step 5: GIP-1 learnable grid irradiance probes.
+# Step 5: OAH-GS GIP-1 learnable grid irradiance probes.
 #
 # Purpose:
-#   Test the true Probe-GI branch of RAP-GI after the code-level GIP-1 module
-#   is implemented. This script intentionally checks for --use_probe_gi before
-#   training so it will not silently run an old NCIF-only code path.
+#   Test the true low-frequency diffuse probe branch after the code-level
+#   GIP-1 module is implemented. This script intentionally checks for
+#   --use_probe_gi before training so it will not silently run an old
+#   NCIF-only code path.
 #
 # Required future flags:
 #   --use_probe_gi
@@ -39,7 +40,9 @@ STEP_ITERS=${STEP_ITERS:-30000}
 PCC_KEEP=${PCC_KEEP:-0.65}
 PCC_TAG=${PCC_KEEP/./}
 PROBE_GRID_RES=${PROBE_GRID_RES:-8}
-STEP_NAME=${STEP_NAME:-step5_gip1_probe_${STEP_ITERS}_pcc${PCC_TAG}_grid${PROBE_GRID_RES}}
+R2SF_MIN_GATE=${R2SF_MIN_GATE:-0.15}
+MIN_TAG=${R2SF_MIN_GATE/./}
+STEP_NAME=${STEP_NAME:-step5_oah_gip1_probe_${STEP_ITERS}_pcc${PCC_TAG}_grid${PROBE_GRID_RES}_mingate${MIN_TAG}}
 OUT_DIR="$OUT_ROOT/$STEP_NAME"
 
 eval_synth() {
@@ -59,7 +62,7 @@ fi
 SYNTH_EVAL="--eval --white_background"
 CHECK_REAL="--test_iterations 10000 15000 18000 20000 --save_iterations 10000 15000 18000 20000"
 
-PROBE_COMMON="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_probe_gi --no_use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate 0.02 --probe_grid_res $PROBE_GRID_RES --probe_sh_degree 2 --probe_lr 0.002"
+PROBE_COMMON="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_probe_gi --no_use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate $R2SF_MIN_GATE --probe_grid_res $PROBE_GRID_RES --probe_sh_degree 2 --probe_lr 0.002"
 PROBE_STRONG="--probe_from_iter 2000 --probe_tau 0.25 --probe_ramp_iters 4000 --probe_diffuse_mu 1.0 --probe_diffuse_nu 1.0 --lambda_probe_smooth 0.005 --lambda_probe_energy 0.0001 --lambda_probe_magnitude 0.001"
 PROBE_MEDIUM="--probe_from_iter 3000 --probe_tau 0.15 --probe_ramp_iters 5000 --probe_diffuse_mu 1.0 --probe_diffuse_nu 1.0 --lambda_probe_smooth 0.003 --lambda_probe_energy 0.0001 --lambda_probe_magnitude 0.001"
 PROBE_REAL="--probe_from_iter 5000 --probe_tau 0.12 --probe_ramp_iters 5000 --probe_diffuse_mu 1.0 --probe_diffuse_nu 1.0 --lambda_probe_smooth 0.004 --lambda_probe_energy 0.0002 --lambda_probe_magnitude 0.001"

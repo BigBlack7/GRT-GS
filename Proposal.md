@@ -1,16 +1,16 @@
-# PhysNorm-GS：面向混合反射场景的反射感知探针全局光照高斯逆渲染
+# OAH-GS：可观测性驱动的混合物理-外观高斯逆渲染
 
 ## 摘要
 
-本文研究 Gaussian Splatting 逆渲染在混合反射场景中的光照分解与稳定优化问题。现有反射高斯方法通常将高频环境贴图、BRDF 材质、法向和间接光放入同一端到端优化过程。该范式在高反射、低粗糙表面上可以从清晰镜面高光获得有效监督，但在漫反射物体、弱反射物体和大规模真实场景中，高频环境贴图缺乏可观测梯度，容易退化为吸收颜色残差的噪声变量。另一方面，仅依赖全局环境贴图也无法表达近场物体间反射和空间变化漫反射全局光照。
+本文研究 Gaussian Splatting 逆渲染在混合反射场景中的光照分解、外观建模与稳定优化问题。现有反射高斯方法通常将高频环境贴图、BRDF 材质、法向和间接光放入同一端到端优化过程。该范式在高反射、低粗糙表面上可以从清晰镜面高光获得有效监督，但在漫反射物体、弱反射物体和大规模真实场景中，高频环境贴图缺乏可观测梯度，容易退化为吸收颜色残差、曝光误差和几何误差的噪声变量。另一方面，真实场景还包含局部外观变化、遮挡、模糊和非物理成像因素，不能被纯 PBR 分解完全解释。
 
-本文提出 **PhysNorm-GS**，一个面向混合反射场景的反射感知探针全局光照高斯逆渲染框架。核心观点是：不同材质区域对不同光照因子的可观测性不同，因此全局光照不应由单一环境贴图统一解释，而应根据反射强度、粗糙度、几何置信度和光度残差分解到远场镜面环境贴图、近场光线追踪辐射和空间漫反射辐照探针中。具体而言，本文提出 **Reflectance-Aware Probe Global Illumination, RAP-GI**：高频远场镜面反射由可靠镜面证据监督；近场镜面和互反射由局部 ray-traced transport 表达；低频漫反射全局光照由可学习 Gaussian irradiance probes 表示。训练上，本文进一步提出阶段一致连续优化以缓解 delayed rendering 阶段切换和材质重置带来的优化断裂。
+本文提出 **OAH-GS, Observability-Aware Hybrid Gaussian Splatting**，一个面向混合反射场景的可观测性驱动混合物理-外观逆渲染框架。核心观点是：不是所有像素都应强制监督所有物理变量。高反射、低粗糙且法向稳定的区域适合监督远场高频环境贴图和近场反射；漫反射、粗糙或弱反射区域更适合监督低频空间辐照或外观基底；真实复杂区域应保留受约束的外观解释能力，避免把不可观测残差错误写入物理光照。训练上，本文进一步提出阶段一致连续优化以缓解 delayed rendering 阶段切换和材质重置带来的优化断裂。
 
 本文贡献如下：
 
-1. 提出 **RAP-GI：反射感知探针全局光照分解**。该方法将混合反射场景中的出射辐射分解为远场高频镜面环境、近场局部反射传输和空间低频漫反射辐照探针，并用材质可靠性决定各分量的监督责任。
-2. 提出 **Material-aware Gaussian Irradiance Probes, MGIP**。该方法在高斯场景中构建可学习的低阶方向辐照探针场，使漫反射和粗糙表面主要监督局部低频全局光照，而不是污染高频环境贴图。
-3. 提出 **Reflectance-Reliable Specular Factorization, R2SF**。该方法仅允许高反射、低粗糙、法向稳定且残差可信的区域强监督高频环境贴图，并将近场反射交给局部光线追踪传输。
+1. 提出 **Observability-Aware Hybrid Decomposition, OAHD**。该方法将混合反射场景的解释责任分配给外观基底、远场镜面环境、近场局部反射传输和低频漫反射辐照，而不是用单一物理光照分支解释所有残差。
+2. 提出 **Reflectance-Reliable Specular Factorization, R2SF**。该方法仅允许高反射、低粗糙、法向稳定且残差可信的区域强监督高频环境贴图；实现上只门控环境贴图光照梯度，不抑制 BRDF 材质和法向学习。
+3. 提出 **Material-aware Gaussian Irradiance Probes, MGIP**。该方法在高斯场景中构建低阶方向辐照探针场或其代理，使漫反射和粗糙表面主要监督低频空间光照，而不是污染高频环境贴图。
 4. 提出 **Phase-Consistent Continuation, PCC**。该方法将阶段切换从硬重置改为置信度软重置和连续过渡，缓解 delayed rendering 进入物理渲染后的指标突降。
 
 ---
@@ -107,7 +107,7 @@ $$
 
 ## 2. 方法概览
 
-PhysNorm-GS 使用 surface-aligned Gaussian primitives 表示几何和材质，并额外维护一个空间辐照探针场。每个 Gaussian $G_i$ 维护：
+OAH-GS 使用 surface-aligned Gaussian primitives 表示几何和材质，并在物理分支之外保留受约束的外观基底。每个 Gaussian $G_i$ 维护：
 
 $$
 G_i
@@ -141,6 +141,8 @@ $$
 $$
 C
 =
+D_{\mathrm{app}}
++
 D_{\mathrm{probe}}
 +
 S_{\mathrm{far}}
@@ -152,7 +154,8 @@ $$
 
 其中：
 
-- $D_{\mathrm{probe}}$：由 Gaussian irradiance probes 提供的漫反射低频全局光照。
+- $D_{\mathrm{app}}$：由高斯外观基底表达的主漫反射颜色和真实图像中难以物理分解的低风险残差。
+- $D_{\mathrm{probe}}$：由 Gaussian irradiance probes 或其代理提供的低频漫反射辐照修正。
 - $S_{\mathrm{far}}$：由高频环境贴图提供的远场镜面反射。
 - $S_{\mathrm{near}}$：由局部 ray-traced transport 提供的近场镜面反射和互反射。
 - $C_{\mathrm{bg}}$：背景与透明度混合项。
@@ -177,11 +180,20 @@ q_{\mathrm{rough}}
 \rho^\alpha r^\eta q_{\mathrm{geo}}q_{\mathrm{photo}}.
 $$
 
-$q_{\mathrm{diff}}$ 高的区域主要监督探针辐照，$q_{\mathrm{spec}}$ 高的区域主要监督远场环境贴图和近场 ray-traced radiance，$q_{\mathrm{rough}}$ 对粗糙镜面提供低频反射混合。
+$q_{\mathrm{diff}}$ 高的区域主要监督外观基底和低频辐照，$q_{\mathrm{spec}}$ 高的区域主要监督远场环境贴图和近场 ray-traced radiance，$q_{\mathrm{rough}}$ 对粗糙镜面提供低频反射混合。当所有物理可观测性均较弱时，优化应优先回退到 $D_{\mathrm{app}}$，而不是强行更新高频环境贴图或近场反射。
+
+### 2.1 场景适用边界
+
+OAH-GS 的目标不是让同一个物理模块在所有场景上都产生同等 PSNR 提升，而是让不同类型场景走不同解释路径：
+
+1. **单物体高反射场景。** 镜面高光和清晰反射可观测，R2SF 与近场反射传输应成为主要收益来源。
+2. **单物体低反射场景。** 环境贴图弱可观测，方法应主要依赖外观基底和几何稳定性，低频辐照分支只能作为小幅修正，不能破坏 baseline。
+3. **真实高反射场景。** 单一全局环境贴图不足以表达位置相关反射，应使用远场 envmap 加局部反射传输，并严格限制漫反射区域污染 envmap。
+4. **真实低反射大场景。** PSNR 往往受曝光、模糊、遮挡、细结构和真实图像非物理残差影响。此时外观基底和稳定优化比复杂 PBR 更重要；物理分支只在可观测区域启用。
 
 ---
 
-## 3. RAP-GI：反射感知全局光照分解
+## 3. OAHD：可观测性驱动的混合分解
 
 ### 3.1 三路光照分解
 
@@ -215,9 +227,10 @@ $$
 $$
 S_{\mathrm{far}}
 =
-q_{\mathrm{spec}}
-f_s(\mathbf{n},\omega_o,r,\rho,E_{\mathrm{HF}}).
+f_s(\mathbf{n},\omega_o,r,\rho,\tilde{L}_{\mathrm{env}}),
 $$
+
+其中 $\tilde{L}_{\mathrm{env}}$ 在前向上等于从高频环境贴图查询到的远场光照，但其反向梯度由 $q_{\mathrm{spec}}$ 调制。
 
 对近场镜面和互反射：
 
@@ -422,19 +435,25 @@ $$
 
 当 $\rho$ 低或 $r$ 高时，$q_{\mathrm{spec}}$ 下降，环境贴图梯度被削弱。这样可避免非反射区域把 diffuse residual 写入 envmap。
 
-实现上，R2SF 不直接压暗前向镜面颜色。否则高反射物体中的真实镜面能量会被错误削弱，导致渲染指标下降。本文采用 forward-preserving gradient gate：
+实现上，R2SF 不直接压暗前向镜面颜色，也不抑制 BRDF 材质因子本身的梯度。早期实验表明，如果把门控施加到整个镜面分支，低反射初始化会同时削弱反射强度、粗糙度、法向和 Fresnel 权重的学习，使优化陷入低镜面解释。因此本文只对远场环境贴图查询得到的光照项施加 forward-preserving gradient gate：
 
 $$
-\tilde{S}_{\mathrm{far}}
+\tilde{L}_{\mathrm{env}}
 =
 q_{\mathrm{spec}}
-S_{\mathrm{far}}
+L_{\mathrm{env}}
 +
 (1-q_{\mathrm{spec}})
-\mathrm{sg}(S_{\mathrm{far}}),
+\mathrm{sg}(L_{\mathrm{env}}),
 $$
 
-其中 $\mathrm{sg}(\cdot)$ 表示停止梯度。由于 $\tilde{S}_{\mathrm{far}}$ 与 $S_{\mathrm{far}}$ 在前向数值上相同，该形式不会改变渲染颜色；但反向传播时，不可靠区域对高频环境贴图和镜面分支的梯度被 $q_{\mathrm{spec}}$ 缩放。
+$$
+S_{\mathrm{far}}
+=
+f_s(\mathbf{n},\omega_o,r,\rho,\tilde{L}_{\mathrm{env}}).
+$$
+
+其中 $\mathrm{sg}(\cdot)$ 表示停止梯度。由于 $\tilde{L}_{\mathrm{env}}$ 与 $L_{\mathrm{env}}$ 在前向数值上相同，该形式不会改变渲染颜色；但反向传播时，不可靠区域只削弱对高频环境贴图的梯度，而材质、粗糙度、反射强度和法向仍能通过重建损失正常优化。实践中可设置很小的下界 $q_{\min}$，避免训练初期因反射强度初始化偏低而完全切断环境贴图学习。
 
 ### 5.2 远场和近场镜面拆分
 
@@ -573,7 +592,7 @@ $$
 2. **GIP-1：Learnable Grid Irradiance Probes。** 在场景 bbox 中放置规则 probe grid，使用 SH2/SH3 表示方向辐照，trilinear interpolation 查询。
 3. **GIP-2：Gaussian-aware Adaptive Probes。** 根据 Gaussian 密度、可见性和场景尺度自适应布置 probes，提高大场景效率。
 4. **GIP-3：DDGI-lite Visibility。** 利用已有 ray tracing 计算 probe visibility moments，缓解漏光和遮挡错误。
-5. **Full RAP-GI。** 联合远场 envmap、近场 ray tracing 和 probe irradiance，形成完整混合反射全局光照逆渲染框架。
+5. **Full OAH-GS。** 联合外观基底、远场 envmap、近场 ray tracing 和 probe irradiance，形成完整可观测性驱动的混合物理-外观逆渲染框架。
 
 ---
 
@@ -581,22 +600,22 @@ $$
 
 传统 irradiance volume、light probes 和 DDGI 证明了空间探针适合表达低频漫反射全局光照。本文不是将其直接用于前向渲染，而是将 probe 作为逆渲染中的可学习物理因子，并用材质可观测性控制其梯度来源。
 
-基于 PBR 的高斯逆渲染和反射高斯方法通常强调环境贴图、BRDF 和 ray tracing 的联合优化。本文指出：环境贴图只适合可靠镜面证据，漫反射区域应监督空间辐照探针，近场反射应交给局部 ray-traced transport。该分解避免单一 envmap 同时解释背景、物体反射和漫反射残差。
+基于 PBR 的高斯逆渲染和反射高斯方法通常强调环境贴图、BRDF 和 ray tracing 的联合优化。本文指出：环境贴图只适合可靠镜面证据，漫反射区域应监督外观基底与空间辐照探针，近场反射应交给局部 ray-traced transport。该分解避免单一 envmap 同时解释背景、物体反射和漫反射残差。
 
-本文与一般 appearance MLP 或颜色残差网络的区别在于：MGIP 是低阶方向辐照场，具有空间平滑、有界响应、材质责任门控和物理可解释性，不是任意外观拟合分支。
+本文与一般 appearance MLP 或颜色残差网络的区别在于：OAH-GS 并不让外观分支无约束吸收全部误差。外观基底只作为低可观测区域的安全解释；MGIP 是低阶方向辐照场，具有空间平滑、有界响应、材质责任门控和物理可解释性，不是任意外观拟合分支。
 
 ---
 
 ## 10. 预期优势
 
-1. **非反射场景更稳。** 漫反射区域主要优化低频 probe irradiance，避免污染高频 envmap。
+1. **非反射场景更稳。** 漫反射区域优先保留外观基底，并只用低频 probe irradiance 做受控修正，避免污染高频 envmap。
 2. **反射场景更准。** 远场 envmap 与近场 ray-traced transport 分工明确，降低背景和局部物体反射冲突。
 3. **真实大场景更适配。** 空间 probes 可表达局部照明变化，优于单个全局环境贴图。
 4. **训练更稳定。** PCC 缓解 delayed rendering 阶段切换和材质重置导致的后期退化。
-5. **创新主线更统一。** R2SF、MGIP、local ray tracing 和 PCC 都服务于同一命题：根据材质可观测性分配全局光照解释责任。
+5. **创新主线更统一。** OAHD、R2SF、MGIP、local ray tracing 和 PCC 都服务于同一命题：根据可观测性分配物理解释和外观解释责任。
 
 ---
 
 ## 11. 最终论文叙事摘要
 
-混合反射 Gaussian 逆渲染的核心困难并非材质参数不足，而是不同材质区域对不同光照因子的可观测性不同。高反射低粗糙区域能监督高频远场环境和近场镜面传输；漫反射和粗糙区域更适合监督空间低频全局辐照；真实大场景还需要处理局部照明变化与阶段优化不稳定。PhysNorm-GS 通过反射感知探针全局光照分解，将远场环境贴图、近场 ray-traced transport 和 Gaussian irradiance probes 统一到一个材质责任驱动的逆渲染框架中，从而减少环境贴图污染，提升混合反射场景的几何、材质和渲染质量。
+混合反射 Gaussian 逆渲染的核心困难并非材质参数不足，而是不同材质区域对不同光照和外观因子的可观测性不同。高反射低粗糙区域能监督高频远场环境和近场镜面传输；漫反射和粗糙区域更适合监督外观基底与空间低频全局辐照；真实大场景还需要处理曝光、遮挡、细结构和阶段优化不稳定。OAH-GS 通过可观测性驱动的混合物理-外观分解，将外观基底、远场环境贴图、近场 ray-traced transport 和 Gaussian irradiance probes 统一到一个责任分配框架中，从而减少环境贴图污染，稳定混合反射场景的几何、材质和渲染质量。
