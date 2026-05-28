@@ -1,6 +1,6 @@
 # OAH-GS 实验记录与阶段计划
 
-本文档只记录工程落地、训练脚本、阶段实验计划和阶段结论。理论方法、公式推导和论文叙事统一放在 `PhysNorm-GS_Proposal.md`。
+本文档只记录工程落地、训练脚本、阶段实验计划和阶段结论。理论方法、公式推导和论文叙事统一放在 `Proposal.md`。
 
 ---
 
@@ -120,6 +120,133 @@ Step 4 fix：`step4_gip0_gradfix_30000_pcc065`。
 - 复测脚本默认提高 `r2if_min_specular_gate` 到 `0.15`，避免训练初期因为反射强度初始化偏低而完全切断 envmap 学习。
 - 新输出目录改名为 `envgate`，与第一次失败的 `gradfix` 结果区分。
 
+### 2.6 Step 2/4 envgate fix 实验回传结论
+
+用户已完成第二次 `train_step_2_fix.sh` 与 `train_step_4_fix.sh`，即只门控远场环境贴图光照梯度的版本。以下以 Ref-Gaussian 30k 为主要基准。
+
+Step 2 fix：`step2_r2sf_envgate_30000_pcc065_mingate015`。
+
+| 场景 | Ref-Gaussian 30k | Step 2 fix | 差值 | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `bell` | 26.68 | 26.76 | +0.08 | 最终略高，但训练峰值 32.37 后掉 4.64dB，仍不稳定 |
+| `chair` | 34.21 | 34.30 | +0.09 | 小幅正收益 |
+| `materials` | 30.53 | 30.07 | -0.46 | 负收益 |
+| `mic` | 34.81 | 34.87 | +0.05 | 基本持平 |
+| `gardenspheres` | 23.13 | 23.11 | -0.02 | 基本持平 |
+| `toaster` | 27.76 | 27.42 | -0.35 | 低于 30k，但高于 50k 回退结果 |
+
+Step 2 结论：R2SF env-light-only gate 修复了最严重的实现错误，但单独远场环境分支仍不能作为全量主线；`bell` 仍存在严重后期回退，`materials/toaster` 低于 30k 基准。
+
+Step 4 fix：`step4_gip0_envgate_30000_pcc065_mingate015`。
+
+| 场景 | Ref-Gaussian 30k | Step 4 fix | 差值 | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `bell` | 26.68 | 31.39 | +4.71 | 明显解决回退，是当前最强正收益 |
+| `chair` | 34.21 | 33.29 | -0.93 | 明显负收益，GIP-0 对 diffuse 设置过强 |
+| `materials` | 30.53 | 30.18 | -0.36 | 负收益 |
+| `mic` | 34.81 | 34.83 | +0.02 | 基本持平 |
+| `gardenspheres` | 23.13 | 23.12 | -0.01 | 基本持平 |
+| `toaster` | 27.76 | 27.85 | +0.09 | 小幅正收益，且无明显回退 |
+
+Step 4 结论：GIP-0/NCIF 不是普适增益模块。它对 `bell` 这种后期回退反射场景很有效，对 `toaster/mic/gardenspheres` 基本安全，但当前强 diffuse 设置伤害 `chair/materials`。因此平均 PSNR 的提升主要来自 `bell`，不能据此直接跑全量 Step 4。
+
+下一步工程处理：
+
+- 暂不跑全量 Step 2/4。
+- 新增 `train_step_4_safety.sh`，只做 GIP-0 安全性小扫参。
+- 对反射控制场景保留已成功的 weak GIP-0 设置。
+- 对 diffuse/weak-reflective 场景改用更晚、更弱、更受 roughness 约束的 conservative GIP-0 设置。
+
+### 2.7 Step 4 safety sweep 实验回传结论
+
+用户已完成 `train_step_4_safety.sh`。本轮目标是验证更保守的 GIP-0 是否能止住 `chair/materials` 的负收益，同时保留 `bell/toaster` 的反射场景收益。
+
+结果：
+
+| 场景 | Ref-Gaussian 30k | Safety | 差值 | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `bell_weak` | 26.68 | 25.59 | -1.09 | 失败；训练曲线 25k 峰值 32.42，但 30k 离线 eval 崩到 25.59 |
+| `toaster_weak` | 27.76 | 27.79 | +0.03 | 基本安全 |
+| `chair_safe005` | 34.21 | 34.12 | -0.09 | 基本止损 |
+| `chair_safe008` | 34.21 | 34.08 | -0.14 | 基本止损，略弱于 safe005 |
+| `materials_safe005` | 30.53 | 30.28 | -0.25 | 仍偏低 |
+| `materials_safe008` | 30.53 | 30.49 | -0.04 | 基本止损，是当前 materials 较好设置 |
+| `mic_safe005` | 34.81 | 34.84 | +0.03 | 基本安全 |
+| `gardenspheres_safe005` | 23.13 | 23.10 | -0.03 | 基本安全 |
+
+结论：
+
+- 更保守的 GIP-0 设置有效解决了 diffuse 场景被强低频残差伤害的问题。
+- `bell` 的失败不是 diffuse 参数问题，而是 25k 后出现严重后期回退；这与 Ref-Gaussian 官方实现中部分场景的 delayed rendering 后期崩溃一致。
+- 当前不应继续全量 Step 4，也不应立刻实现 GIP-1。必须先确认 best checkpoint/早停策略是否能稳定拿到 `bell` 的 25k 峰值。
+
+工程处理：
+
+- 新增 `eval_best_from_curve.py`，用于读取 `eval_curve.txt` 的峰值 iteration，并对对应保存点做离线 eval。
+- 下一步先对 safety 输出运行 best checkpoint 离线评估，确认 `bell_weak@25000` 是否真的能得到 32dB 级别结果。
+
+### 2.8 Best checkpoint 离线验证结论
+
+用户已运行：
+
+```bash
+python eval_best_from_curve.py /data2/zmh/output_physnorm_steps/step4_oah_gip0_safety_30000_pcc065_mingate015 --only-flagged --save-images
+```
+
+结果：
+
+| 场景 | 选择迭代 | 曲线峰值 | 曲线最终 | 离线 PSNR | 离线 SSIM | 离线 LPIPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `bell_weak` | 25000 | 32.4203 | 26.7620 | 31.8244 | 0.9668 | 0.0448 |
+
+结论：
+
+- `bell_weak@25000` 离线 eval 真实有效，说明 OAH-GS/GIP-0 在该场景确实能显著超过 Ref-Gaussian 30k。
+- 失败原因不是方法无效，而是继续训练到 30k 后物理/材质分支崩溃。
+- 后续实验必须把 **best checkpoint selection / early stopping** 纳入标准流程。
+
+注意：
+
+- 当前 `eval_curve.txt` 使用的是训练过程中的 test cameras，因此用于工程诊断是合理的。
+- 若进入论文正式结果，不能直接用 test-set best selection 作为最终数字；需要改为 validation-based selection，或报告固定 iteration 并把 best checkpoint 作为稳定性分析。
+
+### 2.9 Safety sweep 全场景 best 结果分析
+
+用户已对 safety sweep 运行新版全场景 best checkpoint 离线评估。以下以 Ref-Gaussian 30k 为主要基准。本轮数据来自 `step4_oah_gip0_safety_30000_pcc065_mingate015`，因为包含 `chair/materials` 的两个参数变体，平均值只用于诊断，不作为最终论文平均指标。
+
+| 场景 | Ref-Gaussian 30k | Safety best | 选择迭代 | 差值 | 结论 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `bell_weak` | 26.68 | 31.82 | 25k | +5.14 | 强正收益，但必须 best checkpoint |
+| `toaster_weak` | 27.76 | 27.79 | 30k | +0.03 | 基本安全 |
+| `chair_safe005` | 34.21 | 34.12 | 30k | -0.09 | 基本止损，是 chair 推荐设置 |
+| `chair_safe008` | 34.21 | 33.42 | 28k | -0.80 | 曲线与离线不一致，不采用 |
+| `materials_safe005` | 30.53 | 30.28 | 30k | -0.25 | 仍偏低 |
+| `materials_safe008` | 30.53 | 30.49 | 30k | -0.04 | 基本止损，是 materials 推荐设置 |
+| `mic_safe005` | 34.81 | 34.84 | 30k | +0.03 | 基本安全 |
+| `gardenspheres_safe005` | 23.13 | 23.20 | 12k | +0.07 | 小幅正收益，但 LPIPS 偏高，需要后续看图 |
+
+结论：
+
+- Conservative GIP-0 + best checkpoint 已经形成可跑主线：强收益集中在后期回退反射场景，非反射/真实场景基本不伤害。
+- `chair_safe008` 暴露出曲线 PSNR 与离线 eval 可不一致；后续不能只评估曲线最高的单个保存点，应对曲线 top-k 保存点逐个离线 eval。
+- 全量 Step 4 可以继续，但必须采用 conservative 参数，并在训练后执行 top-k offline best selection。
+
+工程处理：
+
+- 已更新 `eval_best_from_curve.py`：默认从已保存的 point cloud iteration 中选择曲线 PSNR 最高的可离线评估点，不再因为峰值未保存而跳过场景。
+- 已加密 Step 2/4/5 脚本在 22k-30k 的保存点，并加入 Ref-Real 的 14k 保存点，避免后续再错过峰值。
+- 已将全量 `train_step_4.sh` 从旧的 strong/medium GIP-0 改为 safety 验证过的 conservative GIP-0 设置，默认输出改为 `step4_oah_gip0_safe_*`。
+- 已增强 `eval_best_from_curve.py`：支持 `--eval-top-k K`，可对曲线排序前 K 个已保存点逐个离线 eval，并按离线 PSNR 选择真正 best checkpoint。
+
+下一步运行全量 Step 4 safe：
+
+```bash
+bash train_step_4.sh
+python eval_best_from_curve.py /data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015 --eval-top-k 3 --save-images
+```
+
+如果全量 Step 4 safe 稳定，再决定是否实现 validation-based checkpoint selection 或进入 GIP-1。
+
 ---
 
 ## 3. 工程实现路线图
@@ -139,10 +266,12 @@ Step 4 fix：`step4_gip0_gradfix_30000_pcc065`。
 
 验证内容：
 
-1. 运行 `train_step_2_fix.sh`，验证 R2SF env-light-only gate。
-2. 若 Step 2 fix 合格，运行 `train_step_4_fix.sh`，验证 GIP-0 是否在 diffuse 场景提供低频收益。
-3. 如果 Step 2 fix 仍压低 `bell/toaster`，暂停所有 GI/probe 扩展，优先调 R2SF 门控下界、env 正则和 PCC。
-4. 如果 Step 4 fix 只提升 diffuse 但伤害 reflective control，则 GIP-0/1 必须加入更强的 `q_diff` 责任约束。
+1. 已完成 `train_step_2_fix.sh`：R2SF env-light-only gate 基本修复实现错误，但 Step 2 单独不够稳定。
+2. 已完成 `train_step_4_fix.sh`：GIP-0 能救 `bell`，但伤害 `chair/materials`。
+3. 已完成 `train_step_4_safety.sh`：更保守 GIP-0 基本保住 `chair/materials`，但 `bell` 再次后期崩溃。
+4. 已完成 `eval_best_from_curve.py` 验证：`bell_weak@25000` 离线 PSNR 为 `31.8244`，峰值 checkpoint 真实有效。
+5. 已发现旧版 best 工具会跳过峰值未保存的场景；已修复为从已保存 iteration 中选择 best，并加密后续训练脚本保存点。
+6. 已完成新版 safety sweep 全场景 best 汇总；下一轮跑全量 `train_step_4.sh` 的 safe 版本，并用 `--eval-top-k 3` 选择离线 best。
 
 ### 3.3 下一步候选实现：GIP-1 最小探针场
 
@@ -325,7 +454,7 @@ bash train_step_4.sh
 默认输出：
 
 ```bash
-/data2/zmh/output_physnorm_steps/step4_oah_gip0_envgate_30000_pcc065_mingate015
+/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015
 ```
 
 ### 4.5.1 `train_step_4_fix.sh`
@@ -358,63 +487,60 @@ bash train_step_4_fix.sh
 
 ## 5. 接下来执行顺序
 
-### 第一轮：OAH 安全性小规模复测
+### 第一轮：全量 Step 4 safe 训练
 
-先不要再跑全量 Step 2/4。第一次 `gradfix` 已证明“门控整个镜面分支”会压制材质学习。现在优先验证第二次修正：只门控远场环境贴图光照梯度，保持 BRDF/material 分支正常学习。
+Safety sweep 已经证明 conservative GIP-0 + best checkpoint 是可跑主线。下一步跑完整 Step 4 safe，并在训练结束后立刻执行 top-k offline best selection：
 
 ```bash
-bash train_step_2_fix.sh
+bash train_step_4.sh
+python eval_best_from_curve.py /data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015 --eval-top-k 3 --save-images
 ```
 
-本次输出目录应为：
+输出文件：
 
 ```bash
-/data2/zmh/output_physnorm_steps/step2_r2sf_envgate_30000_pcc065_mingate015
+/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/summary.txt
+/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/training_regression_summary.txt
+/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/best_iteration_eval_summary.txt
+/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/best_iteration_eval_summary.json
 ```
 
 合格线：
 
-- `bell/toaster` 不能继续低于第一次 `gradfix`，最好恢复到 Step 1/PCC 附近。
-- `chair/materials/mic` 不能出现新的明显最终回退。
-- envmap 不能比 baseline 更噪。
+- 反射控制：`bell` 应显著高于 Ref-Gaussian 30k；`toaster/teapot` 不应下降。
+- 非反射：`chair/materials/mic/ship` 应基本不低于 Ref-Gaussian 30k，允许 `materials` 这类场景小幅持平。
+- Ref-Real：`gardenspheres/toycar/sedan` 至少不能明显下降；若 LPIPS 变差，需要看图判断是否是过平滑或曝光偏移。
 
-如果以上条件满足，再跑：
+### 第二轮：根据 best checkpoint 验证决定路线
 
-```bash
-bash train_step_4_fix.sh
-```
+如果全量 Step 4 safe 合格，则进入正式方法打磨：
 
-输出目录应为：
+1. 实现 validation-based checkpoint selection，避免论文正式结果用 test-set 选点。
+2. 整理 Step 4 safe 作为当前 OAH-GS 主线。
+3. 再决定 GIP-1 是否值得实现。
 
-```bash
-/data2/zmh/output_physnorm_steps/step4_gip0_envgate_30000_pcc065_mingate015
-```
+如果全量 Step 4 safe 不合格，优先实现以下之一，而不是进入 GIP-1：
 
-### 第二轮：全量 OAH-GS Step 2/4
-
-若两个小规模复测稳定，再重跑完整 Step 2/4。脚本已经更新为 `envgate + min_gate=0.15`，不会回到旧参数：
-
-```bash
-bash train_step_2.sh
-bash train_step_4.sh
-```
+1. validation-based best checkpoint selection。
+2. adaptive PCC / early stopping。
+3. appearance fallback，用于真实低可观测区域。
+4. 更严格的 `q_diff/q_spec` 门控。
 
 默认输出：
 
 ```bash
-/data2/zmh/output_physnorm_steps/step2_oah_r2sf_envgate_30000_pcc065_mingate015
-/data2/zmh/output_physnorm_steps/step4_oah_gip0_envgate_30000_pcc065_mingate015
+/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015
 ```
 
 目的：
 
-- 判断“PCC + 远场 envmap 可靠性 + per-Gaussian 低频辐照代理”是否已经形成稳定趋势。
+- 判断“PCC + 远场 envmap 可靠性 + per-Gaussian 低频辐照代理”在全量场景上是否形成稳定趋势。
 - 按场景分组看结果：高反射单物体、低反射单物体、真实反射、真实低反射分别统计。
-- 如果 GIP-0 只对少数 diffuse 场景有效但不稳定，先不急着实现完整 DDGI，而是补强责任门控或外观残差。
+- 如果 GIP-0 仍只对少数回退场景有效但对 diffuse 不稳，先不急着实现完整 DDGI，而是补强责任门控或外观残差。
 
 ### 第三轮：决定下一项实现
 
-根据全量 Step 2/4 结果分支决策：
+根据 best checkpoint 和后续全量 Step 4 结果分支决策：
 
 1. **Step 2 合格，Step 4 明显提升 diffuse/real。** 进入 GIP-1，实现真正的 learnable grid irradiance probes。
 2. **Step 2 合格，Step 4 无明显收益。** 暂缓 GIP-1，优先实现 appearance/exposure residual 或 adaptive PCC，因为真实场景误差可能主要不是 GI。

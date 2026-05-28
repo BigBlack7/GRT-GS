@@ -39,11 +39,11 @@ eval_real() {
 if [ "$STEP_ITERS" -ge 50000 ]; then
   CHECK_SYNTH="--iterations $STEP_ITERS --test_iterations 18000 20000 22000 25000 26000 27000 28000 30000 32000 34000 36000 38000 40000 42000 44000 46000 48000 50000 --save_iterations 18000 20000 22000 25000 26000 27000 28000 30000 32000 34000 36000 38000 40000 42000 44000 46000 48000 50000"
 else
-  CHECK_SYNTH="--iterations $STEP_ITERS --test_iterations 18000 20000 22000 25000 28000 30000 --save_iterations 18000 20000 22000 25000 28000 30000"
+  CHECK_SYNTH="--iterations $STEP_ITERS --test_iterations 18000 20000 22000 23000 24000 25000 26000 27000 28000 29000 30000 --save_iterations 18000 20000 22000 23000 24000 25000 26000 27000 28000 29000 30000"
 fi
 
 SYNTH_EVAL="--eval --white_background"
-CHECK_REAL="--test_iterations 10000 15000 18000 20000 --save_iterations 10000 15000 18000 20000"
+CHECK_REAL="--test_iterations 10000 12000 14000 15000 18000 20000 --save_iterations 10000 12000 14000 15000 18000 20000"
 R2IF_ENV="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --no_use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate $R2SF_MIN_GATE"
 
 run_synth() {

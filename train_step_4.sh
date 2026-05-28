@@ -25,7 +25,7 @@ PCC_KEEP=${PCC_KEEP:-0.65}
 PCC_TAG=${PCC_KEEP/./}
 R2SF_MIN_GATE=${R2SF_MIN_GATE:-0.15}
 MIN_TAG=${R2SF_MIN_GATE/./}
-STEP_NAME=${STEP_NAME:-step4_oah_gip0_envgate_${STEP_ITERS}_pcc${PCC_TAG}_mingate${MIN_TAG}}
+STEP_NAME=${STEP_NAME:-step4_oah_gip0_safe_${STEP_ITERS}_pcc${PCC_TAG}_mingate${MIN_TAG}}
 OUT_DIR="$OUT_ROOT/$STEP_NAME"
 
 eval_synth() {
@@ -39,16 +39,16 @@ eval_real() {
 if [ "$STEP_ITERS" -ge 50000 ]; then
   CHECK_SYNTH="--iterations $STEP_ITERS --test_iterations 18000 20000 22000 25000 26000 27000 28000 30000 32000 34000 36000 38000 40000 42000 44000 46000 48000 50000 --save_iterations 18000 20000 22000 25000 26000 27000 28000 30000 32000 34000 36000 38000 40000 42000 44000 46000 48000 50000"
 else
-  CHECK_SYNTH="--iterations $STEP_ITERS --test_iterations 18000 20000 22000 25000 28000 30000 --save_iterations 18000 20000 22000 25000 28000 30000"
+  CHECK_SYNTH="--iterations $STEP_ITERS --test_iterations 18000 20000 22000 23000 24000 25000 26000 27000 28000 29000 30000 --save_iterations 18000 20000 22000 23000 24000 25000 26000 27000 28000 29000 30000"
 fi
 
 SYNTH_EVAL="--eval --white_background"
-CHECK_REAL="--test_iterations 10000 15000 18000 20000 --save_iterations 10000 15000 18000 20000"
+CHECK_REAL="--test_iterations 10000 12000 14000 15000 18000 20000 --save_iterations 10000 12000 14000 15000 18000 20000"
 NCIF_COMMON="--use_pcc --pcc_keep_ratio $PCC_KEEP --use_r2if --use_ncif --no_use_cgi --lambda_env_tv 0.0001 --lambda_env_energy 0.0001 --r2if_specular_alpha 1.0 --r2if_specular_beta 1.0 --r2if_min_specular_gate $R2SF_MIN_GATE"
-NCIF_STRONG="--ncif_from_iter 2000 --ncif_tau 0.25 --ncif_ramp_iters 4000 --lambda_ncif_smooth 0.005 --lambda_ncif_magnitude 0.001"
-NCIF_MEDIUM="--ncif_from_iter 3000 --ncif_tau 0.15 --ncif_ramp_iters 5000 --lambda_ncif_smooth 0.003 --lambda_ncif_magnitude 0.001"
-NCIF_WEAK="--ncif_from_iter 8000 --ncif_tau 0.06 --ncif_ramp_iters 5000 --lambda_ncif_smooth 0.001 --lambda_ncif_magnitude 0.001"
-NCIF_REAL="--ncif_from_iter 5000 --ncif_tau 0.10 --ncif_ramp_iters 4000 --lambda_ncif_smooth 0.002 --lambda_ncif_magnitude 0.001"
+NCIF_SAFE005="--ncif_from_iter 10000 --ncif_tau 0.05 --ncif_ramp_iters 8000 --ncif_diffuse_mu 1.0 --ncif_diffuse_nu 2.0 --lambda_ncif_smooth 0.005 --lambda_ncif_magnitude 0.002"
+NCIF_SAFE008="--ncif_from_iter 10000 --ncif_tau 0.08 --ncif_ramp_iters 8000 --ncif_diffuse_mu 1.0 --ncif_diffuse_nu 2.0 --lambda_ncif_smooth 0.005 --lambda_ncif_magnitude 0.002"
+NCIF_WEAK="--ncif_from_iter 8000 --ncif_tau 0.06 --ncif_ramp_iters 5000 --ncif_diffuse_mu 1.0 --ncif_diffuse_nu 1.0 --lambda_ncif_smooth 0.001 --lambda_ncif_magnitude 0.001"
+NCIF_REAL="$NCIF_SAFE005"
 
 run_synth() {
   local source_path="$1"
@@ -81,13 +81,13 @@ run_real() {
 }
 
 # Diffuse/weak-reflective scenes: primary GIP-0 target.
-run_synth /data/zmh/Projects/data/nerf_synthetic/chair NerfSynthetic chair "$NCIF_STRONG" ""
-run_synth /data/zmh/Projects/data/nerf_synthetic/ficus NerfSynthetic ficus "$NCIF_STRONG" "--lambda_normal_render_depth 0.05"
-run_synth /data/zmh/Projects/data/nerf_synthetic/hotdog NerfSynthetic hotdog "$NCIF_STRONG" "--lambda_normal_render_depth 0.05"
-run_synth /data/zmh/Projects/data/nerf_synthetic/lego NerfSynthetic lego "--ncif_from_iter 2000 --ncif_tau 0.20 --ncif_ramp_iters 4000 --lambda_ncif_smooth 0.004 --lambda_ncif_magnitude 0.001" "--lambda_normal_render_depth 0.05"
-run_synth /data/zmh/Projects/data/nerf_synthetic/materials NerfSynthetic materials "$NCIF_MEDIUM" ""
-run_synth /data/zmh/Projects/data/nerf_synthetic/mic NerfSynthetic mic "$NCIF_MEDIUM" ""
-run_synth /data/zmh/Projects/data/nerf_synthetic/ship NerfSynthetic ship "$NCIF_MEDIUM" "--lambda_normal_render_depth 0.05"
+run_synth /data/zmh/Projects/data/nerf_synthetic/chair NerfSynthetic chair "$NCIF_SAFE005" ""
+run_synth /data/zmh/Projects/data/nerf_synthetic/ficus NerfSynthetic ficus "$NCIF_SAFE005" "--lambda_normal_render_depth 0.05"
+run_synth /data/zmh/Projects/data/nerf_synthetic/hotdog NerfSynthetic hotdog "$NCIF_SAFE005" "--lambda_normal_render_depth 0.05"
+run_synth /data/zmh/Projects/data/nerf_synthetic/lego NerfSynthetic lego "$NCIF_SAFE005" "--lambda_normal_render_depth 0.05"
+run_synth /data/zmh/Projects/data/nerf_synthetic/materials NerfSynthetic materials "$NCIF_SAFE008" ""
+run_synth /data/zmh/Projects/data/nerf_synthetic/mic NerfSynthetic mic "$NCIF_SAFE005" ""
+run_synth /data/zmh/Projects/data/nerf_synthetic/ship NerfSynthetic ship "$NCIF_SAFE008" "--lambda_normal_render_depth 0.05"
 
 # Real scenes: large-scale weak/reflection-mixed target.
 run_real /data/zmh/Projects/data/ref_real/gardenspheres gardenspheres 4 "--lambda_normal_smooth 0.45"
