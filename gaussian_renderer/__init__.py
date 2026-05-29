@@ -40,6 +40,10 @@ def _ncif_tau(opt):
     return _schedule_weight(opt, "ncif_from_iter", "ncif_ramp_iters", float(getattr(opt, "ncif_tau", 0.0)))
 
 
+def _oaf_tau(opt):
+    return _schedule_weight(opt, "oaf_from_iter", "oaf_ramp_iters", float(getattr(opt, "oaf_tau", 0.0)))
+
+
 def _specular_reliability(refl_strength, roughness, opt=None):
     if opt is not None and not getattr(opt, "use_r2if", True):
         return torch.ones_like(refl_strength)
@@ -83,6 +87,20 @@ def _apply_ncif_diffuse(ref_diffuse, normal_map, ncif_map, refl_strength, roughn
     response = tau * responsibility * torch.tanh(raw)
     diffuse = torch.clamp_min(ref_diffuse * (1.0 + response), 0.0)
     return diffuse, response, responsibility
+
+
+def _apply_oaf(physical_color, appearance_color, refl_strength, roughness, opt=None):
+    if opt is None or not getattr(opt, "use_oaf", False):
+        return physical_color, None
+    tau = _oaf_tau(opt)
+    if tau <= 0.0:
+        return physical_color, None
+    power = float(getattr(opt, "oaf_power", 1.0))
+    max_blend = float(getattr(opt, "oaf_max_blend", 1.0))
+    specular_reliability = _specular_reliability(refl_strength, roughness, opt)
+    appearance_gate = (1.0 - specular_reliability).clamp(0.0, 1.0).pow(power)
+    blend = (tau * appearance_gate).clamp(0.0, max_blend)
+    return physical_color * (1.0 - blend) + appearance_color * blend, blend
 
 
 
@@ -416,7 +434,9 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     ncif_responsibility = None
     if ncif_map is not None:
         diffuse_color, ncif_response, ncif_responsibility = _apply_ncif_diffuse(diffuse_color, normal_map_chw, ncif_map, refl_strength, roughness, opt)
-    final_image = diffuse_color + specular 
+    final_image = diffuse_color + specular
+    oaf_blend = None
+    final_image, oaf_blend = _apply_oaf(final_image, base_color, refl_strength, roughness, opt)
     
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
     if srgb: 
@@ -451,6 +471,8 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     }
     
     results.update({"specular_reliability": specular_reliability})
+    if oaf_blend is not None:
+        results.update({"oaf_blend": oaf_blend})
     if ncif_map is not None:
         results.update({"ncif_map": ncif_map})
         if ncif_response is not None:
@@ -657,6 +679,8 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         normal_map = F.normalize(normal_map, dim=0, eps=1e-6)
         render_diffuse_color, ncif_response, ncif_responsibility = _apply_ncif_diffuse(render_diffuse_color, normal_map, ncif_map, render_refl_strength, render_roughness, opt)
         full_color = render_diffuse_color + render_specular_color
+    oaf_blend = None
+    full_color, oaf_blend = _apply_oaf(full_color, render_ori_color, render_refl_strength, render_roughness, opt)
 
     # Transform linear rgb to srgb with nonlinearly distribution between 0 to 1
     if srgb: 
@@ -692,6 +716,8 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         results.update({"delta_normal_norm": delta_normal_norm.repeat(3,1,1)})
 
     results.update({"specular_reliability": _specular_reliability(render_refl_strength, render_roughness, opt)})
+    if oaf_blend is not None:
+        results.update({"oaf_blend": oaf_blend})
     if ncif_map is not None:
         results.update({"ncif_map": ncif_map})
         if ncif_response is not None:

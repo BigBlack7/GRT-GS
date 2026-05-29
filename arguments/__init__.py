@@ -189,6 +189,12 @@ class OptimizationParams(ParamGroup):
         self.r2if_specular_beta = 1.0
         self.r2if_min_specular_gate = 0.02
         self.r2if_gate_render = False
+        self.use_oaf = False
+        self.oaf_from_iter = 18000
+        self.oaf_tau = 0.25
+        self.oaf_ramp_iters = 4000
+        self.oaf_power = 1.0
+        self.oaf_max_blend = 0.35
         self.use_pcc = True
         self.pcc_keep_ratio = 0.75
         self.use_cgi = True

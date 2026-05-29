@@ -18,6 +18,11 @@
 
 当前实验目标也随之调整：不再要求所有场景都被同一个物理模块显著提升，而是验证 **反射场景有收益、非反射场景不伤害、真实场景更稳定、envmap 更干净**。
 
+从当前阶段开始，实验推进采用两级基准：
+
+1. **外部最低基准。** Ref-Gaussian 30k 作为必须超过或至少不低于的下限，用于证明工程主线没有退化，具体实验数据放在ref_gaussian_baseline.txt中作为参考。
+2. **内部强基准。** PCC + best checkpoint 作为后续创新模块的默认比较对象。R2SF、GIP/OAF、probe 等模块只有在叠加到 PCC 后继续带来收益，才视为对当前工程有增量价值。
+
 ---
 
 ## 2. 已完成实验结论
@@ -246,6 +251,95 @@ python eval_best_from_curve.py /data2/zmh/output_physnorm_steps/step4_oah_gip0_s
 ```
 
 如果全量 Step 4 safe 稳定，再决定是否实现 validation-based checkpoint selection 或进入 GIP-1。
+
+### 2.10 全量 Step 4 safe 结果分析
+
+用户已完成全量 `train_step_4.sh`，输出目录为：
+
+```bash
+/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015
+```
+
+固定最终轮次 `summary.txt` 显示：
+
+- `bell` 最终 PSNR 只有 `25.5065`，训练曲线峰值在 `22k`，最终掉落 `5.5308 dB`。
+- `chair` 最终 PSNR 只有 `32.6276`，但曲线峰值附近离线 eval 能恢复到 `34.1787`，说明曲线 drop 阈值不足以发现所有离线退化。
+- 除 `bell` 外，`training_regression_summary.txt` 没有发现超过 `1 dB` 的曲线级回退。
+
+`--eval-top-k 3` best checkpoint 离线评估结果如下，仍以 Ref-Gaussian 30k 为主要诊断基准：
+
+| 场景 | Ref-Gaussian 30k | Step 4 final | Step 4 best | best 迭代 | best 差值 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `bell` | 26.68 | 25.51 | 32.00 | 22k | +5.32 | best 很强，但最终严重崩溃 |
+| `teapot` | 25.40 | 26.55 | 26.55 | 30k | +1.15 | 明显正收益 |
+| `chair` | 34.21 | 32.63 | 34.18 | 28k | -0.04 | final 崩，best 基本持平 |
+| `ficus` | 35.58 | 35.43 | 35.43 | 30k | -0.15 | 小幅负收益 |
+| `hotdog` | 37.08 | 37.23 | 37.23 | 30k | +0.15 | 小幅正收益 |
+| `lego` | 32.94 | 32.95 | 32.95 | 28k | +0.01 | 持平 |
+| `materials` | 30.53 | 30.34 | 30.34 | 30k | -0.19 | 小幅负收益 |
+| `mic` | 34.81 | 34.81 | 34.81 | 29k | 0.00 | 持平 |
+| `ship` | 30.12 | 30.00 | 30.08 | 24k | -0.04 | 基本持平，但 LPIPS 偏高 |
+| `gardenspheres` | 23.13 | 23.11 | 23.29 | 14k | +0.16 | PSNR 提升，但 LPIPS 变差，需要看图 |
+| `sedan` | 26.23 | 26.08 | 26.08 | 20k | -0.15 | 小幅负收益 |
+| `toycar` | 24.73 | 24.78 | 24.86 | 12k | +0.13 | PSNR/SSIM 提升，LPIPS 需看图 |
+| `toaster` | 27.76 | 27.72 | 27.72 | 30k | -0.04 | 基本持平 |
+
+阶段结论：
+
+- 全量 Step 4 safe 已经证明 conservative GIP-0 不会大面积破坏 baseline，且在 `teapot/hotdog/gardenspheres/toycar` 有小幅正收益。
+- 最大的表观收益来自 `bell` 的 best checkpoint。后续不再围绕 Ref-Gaussian 早期峰值反复审计，而是把 PCC 作为内部强基准，判断新模块是否仍有增量收益。
+- `chair` 暴露了更严重的问题：固定最终 eval 与曲线 best 差距很大，但曲线级 drop 不超过 `1 dB`。因此后续必须用 top-k 离线评估，而不能只看 `training_regression_summary.txt`。
+- 当前结果还不足以进入 GIP-1 或论文主结果。下一步以 PCC + best checkpoint 为内部强基准，继续测试能否通过 OAF 等模块提升弱反射和真实场景。
+- 根据最新决策，Ref-Gaussian 30k 不再反复作为工程推进中心；后续以 PCC + best checkpoint 为内部强基准，Step 4/GIP-0 只在证明超过 PCC 时才保留为主线模块。
+
+工程处理：
+
+- 已给 `eval_best_from_curve.py` 增加 `--min-iteration/--max-iteration`，用于在同一训练预算内做公平 best checkpoint 比较。
+- 下一轮无需重训，先对已有 output 做公平离线审计。
+
+### 2.11 当前决策：以 PCC 为内部基准继续推进
+
+最新实验策略调整如下：
+
+- Ref-Gaussian 30k 作为外部最低下限，不再反复围绕其早期 best 做大量审计。
+- PCC 已经确认为有效稳定模块，后续把 `PCC + best checkpoint` 视为内部强基准。
+- 每个新模块都必须回答：叠加到 PCC 后，是否在关键场景上超过 PCC；若只超过 Ref-Gaussian 但不超过 PCC，则不能作为主线创新。
+- 因此下一项实验不再继续回头测 Ref-Gaussian，而是测试 **OAF：低可观测区域外观回退**。
+
+OAF 目标：
+
+1. 对 `chair/materials/ship` 等弱反射或漫反射场景，避免物理分支后期把指标拉低。
+2. 对 `gardenspheres/toycar/sedan` 等真实场景，缓解曝光、模糊、细结构和不可观测物理残差对 PBR 分支的污染。
+3. 对 `bell/teapot/toaster` 等反射控制场景，OAF 必须保持弱作用，不能偷走可靠镜面解释。
+
+新增脚本：
+
+```bash
+bash train_step_6_oaf.sh
+```
+
+默认输出：
+
+```bash
+/data2/zmh/output_physnorm_steps/step6_oah_oaf_30000_pcc065_tau030_mingate015
+```
+
+脚本会在训练后自动运行：
+
+```bash
+python data_collect.py "$OUT_DIR"
+python eval_best_from_curve.py "$OUT_DIR" --max-iteration 30000 --eval-top-k 5 --save-images
+```
+
+回传文件：
+
+```bash
+summary.txt
+training_regression_summary.txt
+training_regression_drop.svg
+best_iteration_eval_summary.txt
+best_iteration_eval_summary.json
+```
 
 ---
 
@@ -483,69 +577,85 @@ bash train_step_4_fix.sh
 
 状态：训练模板已准备，但必须先完成 GIP-1 代码实现和参数注册后才能运行。脚本会在检测不到 `--use_probe_gi` 参数时主动退出，避免误跑旧逻辑。默认输出名已改为 `step5_oah_gip1_probe_*`。
 
----
+### 4.7 `train_step_6_oaf.sh`
 
-## 5. 接下来执行顺序
+用途：PCC + OAF 低可观测区域外观回退。
 
-### 第一轮：全量 Step 4 safe 训练
+当前测试内容：
 
-Safety sweep 已经证明 conservative GIP-0 + best checkpoint 是可跑主线。下一步跑完整 Step 4 safe，并在训练结束后立刻执行 top-k offline best selection：
+- Diffuse/weak-reflective：`chair / materials / ship / mic / hotdog`
+- Ref-Real：`gardenspheres / toycar / sedan`
+- Reflective controls：`bell / teapot / toaster`
+- 开启：PCC、R2SF、OAF
+- 关闭：NCIF/GIP-0、CGI
+- 默认轮次：合成 30k，Ref-Real 20k
+
+运行：
 
 ```bash
-bash train_step_4.sh
-python eval_best_from_curve.py /data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015 --eval-top-k 3 --save-images
+bash train_step_6_oaf.sh
 ```
-
-输出文件：
-
-```bash
-/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/summary.txt
-/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/training_regression_summary.txt
-/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/best_iteration_eval_summary.txt
-/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015/best_iteration_eval_summary.json
-```
-
-合格线：
-
-- 反射控制：`bell` 应显著高于 Ref-Gaussian 30k；`toaster/teapot` 不应下降。
-- 非反射：`chair/materials/mic/ship` 应基本不低于 Ref-Gaussian 30k，允许 `materials` 这类场景小幅持平。
-- Ref-Real：`gardenspheres/toycar/sedan` 至少不能明显下降；若 LPIPS 变差，需要看图判断是否是过平滑或曝光偏移。
-
-### 第二轮：根据 best checkpoint 验证决定路线
-
-如果全量 Step 4 safe 合格，则进入正式方法打磨：
-
-1. 实现 validation-based checkpoint selection，避免论文正式结果用 test-set 选点。
-2. 整理 Step 4 safe 作为当前 OAH-GS 主线。
-3. 再决定 GIP-1 是否值得实现。
-
-如果全量 Step 4 safe 不合格，优先实现以下之一，而不是进入 GIP-1：
-
-1. validation-based best checkpoint selection。
-2. adaptive PCC / early stopping。
-3. appearance fallback，用于真实低可观测区域。
-4. 更严格的 `q_diff/q_spec` 门控。
 
 默认输出：
 
 ```bash
-/data2/zmh/output_physnorm_steps/step4_oah_gip0_safe_30000_pcc065_mingate015
+/data2/zmh/output_physnorm_steps/step6_oah_oaf_30000_pcc065_tau030_mingate015
 ```
 
-目的：
+---
 
-- 判断“PCC + 远场 envmap 可靠性 + per-Gaussian 低频辐照代理”在全量场景上是否形成稳定趋势。
-- 按场景分组看结果：高反射单物体、低反射单物体、真实反射、真实低反射分别统计。
-- 如果 GIP-0 仍只对少数回退场景有效但对 diffuse 不稳，先不急着实现完整 DDGI，而是补强责任门控或外观残差。
+## 5. 接下来执行顺序
+
+### 第一轮：PCC 基准上的 OAF 增量实验
+
+当前不再优先回头审计 Ref-Gaussian，而是直接检验新模块是否能超过 PCC 内部强基准。先运行：
+
+```bash
+bash train_step_6_oaf.sh
+```
+
+重点比较对象：
+
+- PCC-only 的对应场景 best checkpoint。
+- Step 4 safe 的对应场景 best checkpoint。
+- Ref-Gaussian 30k 只作为下限参考。
+
+回传：
+
+```bash
+summary.txt
+training_regression_summary.txt
+training_regression_drop.svg
+best_iteration_eval_summary.txt
+best_iteration_eval_summary.json
+```
+
+合格线：
+
+- OAF 应在 `chair/materials/ship/real` 中至少部分超过 PCC 或 Step 4 safe。
+- OAF 不能显著伤害 `bell/teapot/toaster`。
+- 如果 OAF 对真实场景 PSNR 提升但 LPIPS 变差，需要看图决定是否是过平滑或曝光偏移。
+
+### 第二轮：validation-based checkpoint selection
+
+如果 OAF 或 Step 4 中任一模块确认超过 PCC，必须实现 validation-based checkpoint selection。当前 `eval_curve.txt` 使用 test/test_fast 做选择，只能用于工程诊断，不能作为正式论文最终数字。
+
+目标：
+
+1. 从训练视角中固定抽取 validation cameras。
+2. 用 validation 曲线选择 checkpoint。
+3. 最终只在 test cameras 上离线评估一次。
+4. baseline、PCC、Step 4 使用完全相同的 selection protocol。
 
 ### 第三轮：决定下一项实现
 
-根据 best checkpoint 和后续全量 Step 4 结果分支决策：
+根据 OAF 相对 PCC 的结果分支决策：
 
-1. **Step 2 合格，Step 4 明显提升 diffuse/real。** 进入 GIP-1，实现真正的 learnable grid irradiance probes。
-2. **Step 2 合格，Step 4 无明显收益。** 暂缓 GIP-1，优先实现 appearance/exposure residual 或 adaptive PCC，因为真实场景误差可能主要不是 GI。
-3. **Step 2 仍伤害反射场景。** 暂停 probe/GI，回到 R2SF 门控、env 正则和远场/近场拆分。
-4. **Step 4 提升 diffuse 但伤害反射控制。** 增强 `q_diff`，让低频分支更严格只作用于漫反射/粗糙区域。
+1. **OAF 超过 PCC 且不伤害反射控制。** 将 OAF 纳入 OAHD 主线，并继续实现 validation-based selection。
+2. **OAF 只改善真实场景但伤害合成场景。** 将 OAF 限定为 Ref-Real/低可观测区域模块，增强门控或降低 `oaf_tau`。
+3. **OAF 与 PCC 接近。** 说明当前瓶颈不是低可观测外观回退，转向 GIP-1 grid irradiance probes。
+4. **OAF 明显低于 PCC。** 放弃 OAF 主线，只保留为 ablation，优先做 adaptive PCC / early stopping。
+5. **真实场景 LPIPS 变差。** 优先看图判断是否过平滑、曝光偏移或背景污染，不急着堆 DDGI-lite。
 
 实现 GIP-1 后运行：
 

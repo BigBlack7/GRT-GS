@@ -360,6 +360,8 @@ def save_training_vis(viewpoint_cam, gaussians, background, render_fn, pipe, opt
                     render_pkg["direct_light"],
                     render_pkg["indirect_light"],
                 ]
+            if "oaf_blend" in render_pkg:
+                visualization_list.append(render_pkg["oaf_blend"].repeat(3, 1, 1))
 
         else:
             visualization_list = [
@@ -376,6 +378,8 @@ def save_training_vis(viewpoint_cam, gaussians, background, render_fn, pipe, opt
                 render_pkg["surf_normal"] * 0.5 + 0.5,  
                 error_map, 
             ]
+            if "oaf_blend" in render_pkg:
+                visualization_list.append(render_pkg["oaf_blend"].repeat(3, 1, 1))
   
 
         grid = torch.stack(visualization_list, dim=0)

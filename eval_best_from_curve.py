@@ -142,6 +142,8 @@ def main():
     parser.add_argument("--select-splits", default="test,test_fast", help="Comma-separated curve splits used for selecting the best iteration. Earlier names have lower priority.")
     parser.add_argument("--exact-peak-only", action="store_true", help="Skip scenes if the curve peak iteration was not saved. Default selects the best saved iteration.")
     parser.add_argument("--eval-top-k", type=int, default=1, help="Evaluate the top-K saved curve iterations offline and keep the best PSNR.")
+    parser.add_argument("--min-iteration", "--min-iter", dest="min_iteration", type=int, default=None, help="Ignore saved curve/eval candidates before this iteration.")
+    parser.add_argument("--max-iteration", "--max-iter", dest="max_iteration", type=int, default=None, help="Ignore saved curve/eval candidates after this iteration.")
     parser.add_argument("--save-images", action="store_true")
     parser.add_argument("--keep-metric", action="store_true", help="Keep metric.txt overwritten by the selected iteration. Default restores original metric.txt.")
     args = parser.parse_args()
@@ -155,6 +157,10 @@ def main():
 
     for dataset, scene, scene_path in collect_scenes(output_dir):
         curve_rows = parse_curve(scene_path / "eval_curve.txt", select_splits)
+        if args.min_iteration is not None:
+            curve_rows = [row for row in curve_rows if row["iteration"] >= args.min_iteration]
+        if args.max_iteration is not None:
+            curve_rows = [row for row in curve_rows if row["iteration"] <= args.max_iteration]
         if not curve_rows:
             continue
         peak = max(curve_rows, key=lambda item: item["psnr"])
@@ -162,6 +168,10 @@ def main():
         drop = peak["psnr"] - final["psnr"]
         scene_key = f"{dataset}/{scene}"
         available_iters = saved_iterations(scene_path)
+        if args.min_iteration is not None:
+            available_iters = {iteration for iteration in available_iters if iteration >= args.min_iteration}
+        if args.max_iteration is not None:
+            available_iters = {iteration for iteration in available_iters if iteration <= args.max_iteration}
         if scene_key in overrides:
             selected_candidates = [{"iteration": overrides[scene_key], "split": "override", "psnr": None}]
         elif args.exact_peak_only:
@@ -249,6 +259,8 @@ def main():
         f.write("=" * 120 + "\n")
         f.write(f"Best-Iteration Offline Evaluation: {output_dir}\n")
         f.write(f"Selection splits: {', '.join(select_splits)}\n")
+        if args.min_iteration is not None or args.max_iteration is not None:
+            f.write(f"Iteration range: {args.min_iteration if args.min_iteration is not None else '-inf'} to {args.max_iteration if args.max_iteration is not None else '+inf'}\n")
         f.write("=" * 120 + "\n")
         f.write(f"{'Dataset':<18} {'Scene':<24} {'Iter':>8} {'SelCurve':>10} {'CurvePeak':>10} {'CurveFinal':>11} {'Drop':>8} {'PSNR':>12} {'SSIM':>12} {'LPIPS':>12}\n")
         f.write("-" * 120 + "\n")
@@ -270,7 +282,19 @@ def main():
             )
         f.write("=" * 120 + "\n")
     with json_path.open("w", encoding="utf-8") as f:
-        json.dump({"output_dir": str(output_dir), "select_splits": select_splits, "averages": averages, "scenes": rows}, f, indent=2, ensure_ascii=False)
+        json.dump(
+            {
+                "output_dir": str(output_dir),
+                "select_splits": select_splits,
+                "min_iteration": args.min_iteration,
+                "max_iteration": args.max_iteration,
+                "averages": averages,
+                "scenes": rows,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
     print(f"-> 已写入: {summary_path}")
     print(f"-> 已写入: {json_path}")
 
