@@ -163,6 +163,73 @@ def calculate_loss(viewpoint_camera, pc, render_pkg, opt, iteration):
     else:
         tb_dict["loss_ncif_magnitude"] = torch.zeros_like(loss)
 
+    probe_active = getattr(opt, "use_probe_gi", False) and iteration > getattr(opt, "probe_from_iter", 0)
+    if getattr(opt, "lambda_probe_smooth", 0.0) > 0 and probe_active:
+        probe_map = render_pkg.get("probe_map")
+        if probe_map is not None:
+            loss_probe_smooth = first_order_edge_aware_loss(probe_map, gt_image)
+            tb_dict["loss_probe_smooth"] = loss_probe_smooth.item()
+            loss = loss + opt.lambda_probe_smooth * loss_probe_smooth
+        else:
+            tb_dict["loss_probe_smooth"] = torch.zeros_like(loss)
+    else:
+        tb_dict["loss_probe_smooth"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_probe_magnitude", 0.0) > 0 and probe_active:
+        probe_map = render_pkg.get("probe_map")
+        if probe_map is not None:
+            loss_probe_magnitude = probe_map.pow(2).mean()
+            tb_dict["loss_probe_magnitude"] = loss_probe_magnitude.item()
+            loss = loss + opt.lambda_probe_magnitude * loss_probe_magnitude
+        else:
+            tb_dict["loss_probe_magnitude"] = torch.zeros_like(loss)
+    else:
+        tb_dict["loss_probe_magnitude"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_probe_energy", 0.0) > 0 and probe_active and hasattr(pc, "probe_energy_loss"):
+        loss_probe_energy = pc.probe_energy_loss() + pc.probe_smoothness_loss()
+        tb_dict["loss_probe_energy"] = loss_probe_energy.item()
+        loss = loss + opt.lambda_probe_energy * loss_probe_energy
+    else:
+        tb_dict["loss_probe_energy"] = torch.zeros_like(loss)
+
+    prt_active = getattr(opt, "use_prt_gs", False) and iteration > getattr(opt, "prt_from_iter", 0)
+    if getattr(opt, "lambda_prt_smooth", 0.0) > 0 and prt_active:
+        prt_map = render_pkg.get("prt_map")
+        if prt_map is not None:
+            loss_prt_smooth = first_order_edge_aware_loss(prt_map, gt_image)
+            tb_dict["loss_prt_smooth"] = loss_prt_smooth.item()
+            loss = loss + opt.lambda_prt_smooth * loss_prt_smooth
+        else:
+            tb_dict["loss_prt_smooth"] = torch.zeros_like(loss)
+    else:
+        tb_dict["loss_prt_smooth"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_prt_magnitude", 0.0) > 0 and prt_active:
+        prt_map = render_pkg.get("prt_map")
+        if prt_map is not None:
+            loss_prt_magnitude = prt_map.pow(2).mean()
+            tb_dict["loss_prt_magnitude"] = loss_prt_magnitude.item()
+            loss = loss + opt.lambda_prt_magnitude * loss_prt_magnitude
+        else:
+            tb_dict["loss_prt_magnitude"] = torch.zeros_like(loss)
+    else:
+        tb_dict["loss_prt_magnitude"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_prt_energy", 0.0) > 0 and prt_active and hasattr(pc, "prt_energy_loss"):
+        loss_prt_energy = pc.prt_energy_loss()
+        tb_dict["loss_prt_energy"] = loss_prt_energy.item()
+        loss = loss + opt.lambda_prt_energy * loss_prt_energy
+    else:
+        tb_dict["loss_prt_energy"] = torch.zeros_like(loss)
+
+    if getattr(opt, "lambda_prt_occlusion", 0.0) > 0 and prt_active and hasattr(pc, "prt_occlusion_loss"):
+        loss_prt_occlusion = pc.prt_occlusion_loss()
+        tb_dict["loss_prt_occlusion"] = loss_prt_occlusion.item()
+        loss = loss + opt.lambda_prt_occlusion * loss_prt_occlusion
+    else:
+        tb_dict["loss_prt_occlusion"] = torch.zeros_like(loss)
+
     if getattr(opt, "lambda_env_tv", 0.0) > 0:
         loss_env_tv = cubemap_tv_loss(pc.get_envmap.base) + cubemap_tv_loss(pc.get_envmap_2.base)
         tb_dict["loss_env_tv"] = loss_env_tv.item()

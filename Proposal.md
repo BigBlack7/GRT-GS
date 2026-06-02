@@ -394,9 +394,38 @@ $$
 
 这一有界性使 probe 表达的是低频全局光照残差，而不是任意外观网络。
 
+### 4.3.1 首版工程实现
+
+当前首版采用规则空间 probe grid 作为 MGIP 的最小可验证版本。设场景高斯包围盒为 $\mathcal{B}$，在 $\mathcal{B}$ 内放置 $R^3$ 个 probes。每个 probe 维护 SH2 RGB 系数 $\mathbf{c}_{j,lm}\in\mathbb{R}^3$。对每个 Gaussian 中心 $\mathbf{x}_i$，使用 trilinear interpolation 查询邻近 probes，并以 Gaussian 法向 $\mathbf{n}_i$ 计算：
+
+$$
+\hat{I}_{p}(\mathbf{x}_i,\mathbf{n}_i)
+=
+\sum_{j\in\mathcal{N}(\mathbf{x}_i)}
+w_j(\mathbf{x}_i)
+\sum_{l,m}\mathbf{c}_{j,lm}Y_{lm}(\mathbf{n}_i).
+$$
+
+该值作为每个 Gaussian 的附加低频辐照属性参与 rasterization，得到像素级 $\hat{I}_{p}(\mathbf{u})$。实际渲染中采用有界乘性残差：
+
+$$
+D'(\mathbf{u})
+=
+\max\left(
+D(\mathbf{u})
+\left[
+1+\tau q_{\mathrm{diff}}(\mathbf{u})
+\tanh\left(\hat{I}_{p}(\mathbf{u})\right)
+\right],
+0
+\right).
+$$
+
+这一实现有三个目的：第一，probe 初始为零时严格退化到原始 diffuse 分支；第二，$\tanh$ 和 $\tau q_{\mathrm{diff}}$ 限制探针不能成为无界外观贴图；第三，probe 只在低反射、粗糙区域获得强梯度，从而避免破坏高频镜面反射和远场环境贴图。
+
 ### 4.4 探针正则
 
-本文使用空间平滑、能量约束和非负约束：
+本文使用空间平滑、能量约束和幅值约束：
 
 $$
 \mathcal{R}(\mathcal{P})
@@ -410,11 +439,11 @@ $$
 \overline{I}_{\mathcal{P}}-\overline{E}_{\mathrm{LF}}
 \right)^2
 +
-\lambda_{\mathrm{neg}}
-\|\min(I_{\mathcal{P}},0)\|_2^2.
+\lambda_{\mathrm{mag}}
+\|I_{\mathcal{P}}\|_2^2.
 $$
 
-其中 $\mathcal{E}_{p}$ 是 probe 邻接图。该正则使探针在空间上平滑，并避免辐照能量无界漂移。
+其中 $\mathcal{E}_{p}$ 是 probe 邻接图。该正则使探针在空间上平滑，并避免辐照能量无界漂移。若后续实验发现 probe 出现负辐照或明显色偏，可进一步加入显式非负约束；首版以有界残差和幅值惩罚控制其表达能力。
 
 ### 4.5 DDGI-lite 可见性扩展
 
@@ -439,6 +468,75 @@ V(\mathbf{x},\omega)
 $$
 
 其中 $\sigma^2=m_2-m_1^2$。该扩展用于大场景和遮挡复杂场景，但不作为首版必须实现项。
+
+### 4.6 PRT 启发的 Gaussian Radiance Transfer
+
+首版规则 probe grid 的实验表明，密集空间探针虽然有物理动机，但在 3DGS 逆渲染中存在两个问题：一是每次渲染都需要对大量 Gaussians 做空间查询和 SH irradiance 计算，真实场景训练代价过高；二是 probe 容易退化为低频空间颜色场，与 Gaussian 颜色、环境贴图和材质参数竞争解释权。
+
+传统 PRT 的核心思想不是增加空间颜色容量，而是将低频入射光照和局部传输函数都投影到球谐基中，使渲染近似为：
+
+$$
+E(\mathbf{x})
+=
+\int_{\Omega}
+L(\omega)
+T(\mathbf{x},\omega)
+d\omega
+\approx
+\sum_{l,m}
+L_{lm}
+T_{lm}(\mathbf{x}).
+$$
+
+这对本文有直接启发：3DGS 原生 SH 表示的是视角相关 radiance，也就是从 Gaussian 到相机方向的外观颜色；PRT 中的 SH 表示的是 incident lighting 与 local transfer。二者都用 SH，但物理含义不同。因此，下一阶段可将 MGIP 从 grid probe 改写为 **Gaussian Radiance Transfer**：
+
+$$
+I_{\mathrm{GRT}}(\mathbf{x}_i)
+=
+\sum_{l,m}
+\mathbf{L}_{lm}^{d}
+T_{i,lm},
+$$
+
+其中 $\mathbf{L}_{lm}^{d}$ 是共享低频漫反射 lighting SH，$T_{i,lm}$ 是第 $i$ 个 Gaussian 的 transfer coefficient。最小版本中，$T_i$ 由 Gaussian 法向解析给出 Lambertian clamped-cosine transfer，并乘以少量可学习遮蔽或低秩 residual：
+
+$$
+T_{i,lm}
+=
+o_i
+T_{lm}^{\mathrm{Lambert}}(\mathbf{n}_i)
++
+\Delta T_{i,lm},
+\quad
+\|\Delta T_i\| \ll \|T_i^{\mathrm{Lambert}}\|.
+$$
+
+最终 diffuse 修正为：
+
+$$
+D_i'
+=
+D_i
+\left[
+1+
+\tau q_{\mathrm{diff},i}
+\tanh(I_{\mathrm{GRT}}(\mathbf{x}_i))
+\right].
+$$
+
+与 grid probe 相比，GRT 具有更强约束：光照是共享低频 SH，传输主要由法线和遮蔽控制，只有很小的 residual 自由度。这减少了任意颜色拟合的风险，也避免了规则 probe grid 的空间查询开销。若需要表达真实大场景的空间光照变化，可进一步引入少量分区 lighting SH：
+
+$$
+I_{\mathrm{GRT}}(\mathbf{x}_i)
+=
+\sum_k
+\pi_k(\mathbf{x}_i)
+\sum_{l,m}
+\mathbf{L}_{k,lm}^{d}
+T_{i,lm},
+$$
+
+其中 $\pi_k$ 是低维空间/材质分区权重。该形式比 dense probes 更接近 PRT 的低秩 factorization，也更适合作为本文的后续核心版本。
 
 ---
 
@@ -533,6 +631,44 @@ q_i^{\mathrm{keep}}\theta_i^{-}
 $$
 
 可靠高斯保留已有外观和材质，不可靠高斯重新初始化。
+
+在最小实现中，$q_i^{\mathrm{keep}}$ 可退化为全局常数。进一步地，本文采用 **Adaptive PCC, APCC**，根据 Gaussian 级几何和材质置信度自适应决定保留强度：
+
+$$
+q_i^{\mathrm{opac}}
+=
+\alpha_i^\gamma ,
+$$
+
+$$
+q_i^{\mathrm{spec}}
+=
+\left[
+\rho_i(1-r_i)
+\right]^\gamma ,
+$$
+
+$$
+c_i
+=
+\frac{
+w_o q_i^{\mathrm{opac}}
++
+w_s q_i^{\mathrm{spec}}
+}{
+w_o+w_s
+},
+$$
+
+$$
+q_i^{\mathrm{keep}}
+=
+q_{\min}
++
+(q_{\max}-q_{\min})c_i .
+$$
+
+其中 $\alpha_i$ 是不透明度，$\rho_i$ 是反射强度，$r_i$ 是粗糙度。高不透明度、高反射且低粗糙的 Gaussian 往往已经获得更可靠的几何和材质证据，应更多保留阶段切换前的状态；低不透明度或材质证据弱的 Gaussian 则更靠近初始化值，以减少 delayed rendering 后的噪声传播。APCC 将固定 keep ratio 扩展为可解释的 Gaussian 级阶段连续策略。
 
 ### 6.2 连续过渡与蒸馏
 

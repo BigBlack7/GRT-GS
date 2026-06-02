@@ -143,6 +143,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Set render
         opt.enable_ncif = dataset.use_ncif and iteration >= opt.ncif_from_iter
+        opt.enable_probe_gi = getattr(opt, "use_probe_gi", False) and iteration >= getattr(opt, "probe_from_iter", 0)
+        opt.enable_prt_gs = getattr(opt, "use_prt_gs", False) and iteration >= getattr(opt, "prt_from_iter", 0)
         opt.current_iteration = iteration
         render = select_render_method(iteration, opt, initial_stage)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, srgb=opt.srgb, opt=opt)
@@ -178,8 +180,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_depth_smooth_for_log = 0.4 * depth_smooth_loss + 0.6 * ema_depth_smooth_for_log
             ema_psnr_for_log = 0.4 * psnr(image, gt_image).mean().double().item() + 0.6 * ema_psnr_for_log
             if iteration % TEST_INTERVAL == 0:
-                psnr_test = evaluate_psnr(scene, render, {"pipe": pipe, "bg_color": background, "opt": opt})
-                append_eval_curve(model_path, iteration, "test_fast", None, psnr_test)
+                fast_split = "val_fast" if len(scene.getValCameras()) > 0 else "test_fast"
+                psnr_test = evaluate_psnr(scene, render, {"pipe": pipe, "bg_color": background, "opt": opt}, split=fast_split.split("_")[0])
+                append_eval_curve(model_path, iteration, fast_split, None, psnr_test)
             if iteration % 10 == 0:
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
@@ -313,6 +316,28 @@ def reset_gaussian_para(gaussians, opt):
 
 def soft_reset_gaussian_para(gaussians, opt):
     keep_ratio = max(0.0, min(1.0, float(opt.pcc_keep_ratio)))
+    if getattr(opt, "use_adaptive_pcc", False):
+        with torch.no_grad():
+            min_keep = max(0.0, min(1.0, float(getattr(opt, "pcc_min_keep", 0.45))))
+            max_keep = max(min_keep, min(1.0, float(getattr(opt, "pcc_max_keep", 0.85))))
+            opacity_w = max(0.0, float(getattr(opt, "pcc_opacity_weight", 0.7)))
+            specular_w = max(0.0, float(getattr(opt, "pcc_specular_weight", 0.3)))
+            gamma = max(1e-6, float(getattr(opt, "pcc_confidence_gamma", 1.0)))
+            weight_sum = max(opacity_w + specular_w, 1e-6)
+
+            opacity_conf = gaussians.get_opacity.detach().clamp(0.0, 1.0).pow(gamma)
+            specular_conf = (
+                gaussians.get_refl.detach().clamp(0.0, 1.0)
+                * (1.0 - gaussians.get_rough.detach().clamp(0.0, 1.0))
+            ).pow(gamma)
+            confidence = (opacity_w * opacity_conf + specular_w * specular_conf) / weight_sum
+            keep_ratio = min_keep + (max_keep - min_keep) * confidence.clamp(0.0, 1.0)
+            print(
+                "[PCC] adaptive keep "
+                f"mean={keep_ratio.mean().item():.4f}, "
+                f"min={keep_ratio.min().item():.4f}, "
+                f"max={keep_ratio.max().item():.4f}"
+            )
     gaussians.soft_reset_ori_color(keep_ratio=keep_ratio)
     gaussians.soft_reset_refl_strength(opt.init_refl_value, keep_ratio=keep_ratio)
     gaussians.soft_reset_roughness(opt.init_roughness_value, keep_ratio=keep_ratio)
@@ -362,6 +387,16 @@ def save_training_vis(viewpoint_cam, gaussians, background, render_fn, pipe, opt
                 ]
             if "oaf_blend" in render_pkg:
                 visualization_list.append(render_pkg["oaf_blend"].repeat(3, 1, 1))
+            if "specular_reliability" in render_pkg:
+                visualization_list.append(render_pkg["specular_reliability"].repeat(3, 1, 1))
+            if "probe_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["probe_map"]) * 0.5 + 0.5)
+            if "probe_responsibility" in render_pkg:
+                visualization_list.append(render_pkg["probe_responsibility"].repeat(3, 1, 1))
+            if "prt_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["prt_map"]) * 0.5 + 0.5)
+            if "prt_responsibility" in render_pkg:
+                visualization_list.append(render_pkg["prt_responsibility"].repeat(3, 1, 1))
 
         else:
             visualization_list = [
@@ -380,6 +415,16 @@ def save_training_vis(viewpoint_cam, gaussians, background, render_fn, pipe, opt
             ]
             if "oaf_blend" in render_pkg:
                 visualization_list.append(render_pkg["oaf_blend"].repeat(3, 1, 1))
+            if "specular_reliability" in render_pkg:
+                visualization_list.append(render_pkg["specular_reliability"].repeat(3, 1, 1))
+            if "probe_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["probe_map"]) * 0.5 + 0.5)
+            if "probe_responsibility" in render_pkg:
+                visualization_list.append(render_pkg["probe_responsibility"].repeat(3, 1, 1))
+            if "prt_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["prt_map"]) * 0.5 + 0.5)
+            if "prt_responsibility" in render_pkg:
+                visualization_list.append(render_pkg["prt_responsibility"].repeat(3, 1, 1))
   
 
         grid = torch.stack(visualization_list, dim=0)
@@ -462,6 +507,8 @@ def write_eval_curve_svg(curve_path, svg_path):
         return
 
     colors = {
+        "val_fast": "#7c3aed",
+        "val": "#9333ea",
         "test_fast": "#2563eb",
         "test": "#16a34a",
         "train": "#d97706",
@@ -553,8 +600,13 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        validation_configs = []
+        if len(scene.getValCameras()) > 0:
+            validation_configs.append({'name': 'val', 'cameras' : scene.getValCameras()})
+        validation_configs.extend((
+            {'name': 'test', 'cameras' : scene.getTestCameras()},
+            {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
+        ))
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -604,17 +656,23 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         torch.cuda.empty_cache()
 
 @torch.no_grad()
-def evaluate_psnr(scene, renderFunc, renderkwargs):
+def evaluate_psnr(scene, renderFunc, renderkwargs, split="test"):
     psnr_test = 0.0
     torch.cuda.empty_cache()
-    if len(scene.getTestCameras()):
-        for viewpoint in scene.getTestCameras():
+    if split == "val":
+        cameras = scene.getValCameras()
+    elif split == "train":
+        cameras = scene.getTrainCameras()
+    else:
+        cameras = scene.getTestCameras()
+    if len(cameras):
+        for viewpoint in cameras:
             render_pkg = renderFunc(viewpoint, scene.gaussians, **renderkwargs)
             image = torch.clamp(render_pkg["render"], 0.0, 1.0)
             gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
             psnr_test += psnr(image, gt_image).mean().double()
 
-        psnr_test /= len(scene.getTestCameras())
+        psnr_test /= len(cameras)
         
     torch.cuda.empty_cache()
     return psnr_test

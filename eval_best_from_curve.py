@@ -54,8 +54,21 @@ def read_metric(metric_path):
     return parse_metric_text(path.read_text(encoding="utf-8", errors="ignore"))
 
 
-def copy_if_exists(src, dst):
-    if Path(src).exists():
+def cache_paths(scene_path, iteration):
+    scene_path = Path(scene_path)
+    return scene_path / f"metric_best_{iteration}.txt", scene_path / f"results_best_{iteration}.json"
+
+
+def read_cached_candidate(scene_path, iteration):
+    metric_path, _ = cache_paths(scene_path, iteration)
+    metrics = read_metric(metric_path)
+    if "psnr" not in metrics:
+        return None
+    return metrics
+
+
+def copy_if_exists(src, dst, overwrite=True):
+    if Path(src).exists() and (overwrite or not Path(dst).exists()):
         shutil.copy2(src, dst)
 
 
@@ -142,13 +155,20 @@ def main():
     parser.add_argument("--select-splits", default="test,test_fast", help="Comma-separated curve splits used for selecting the best iteration. Earlier names have lower priority.")
     parser.add_argument("--exact-peak-only", action="store_true", help="Skip scenes if the curve peak iteration was not saved. Default selects the best saved iteration.")
     parser.add_argument("--eval-top-k", type=int, default=1, help="Evaluate the top-K saved curve iterations offline and keep the best PSNR.")
+    parser.add_argument("--selection-mode", choices=["offline", "curve"], default="offline", help="offline: choose the best offline PSNR among evaluated candidates; curve: choose the first curve-ranked candidate and use other candidates only as diagnostics.")
+    parser.add_argument("--summary-suffix", default="", help="Optional suffix for output summary filenames, e.g. val creates best_iteration_eval_summary_val.txt.")
     parser.add_argument("--min-iteration", "--min-iter", dest="min_iteration", type=int, default=None, help="Ignore saved curve/eval candidates before this iteration.")
     parser.add_argument("--max-iteration", "--max-iter", dest="max_iteration", type=int, default=None, help="Ignore saved curve/eval candidates after this iteration.")
     parser.add_argument("--save-images", action="store_true")
+    parser.add_argument("--force-eval", action="store_true", help="Ignore cached metric_best_ITER.txt files and re-run eval.py.")
     parser.add_argument("--keep-metric", action="store_true", help="Keep metric.txt overwritten by the selected iteration. Default restores original metric.txt.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).resolve()
+    if not output_dir.exists():
+        print(f"[停止] 输出目录不存在: {output_dir}")
+        print("[提示] 请先确认训练是否成功运行，或检查 OUT_ROOT/STEP_NAME 是否和训练输出一致。")
+        sys.exit(2)
     script_dir = Path(__file__).resolve().parent
     eval_py = script_dir / "eval.py"
     overrides = dict(args.scene_iter)
@@ -193,14 +213,27 @@ def main():
         result_path = scene_path / "results.json"
         metric_backup = scene_path / ".metric.before_best_eval.txt"
         result_backup = scene_path / ".results.before_best_eval.json"
-        copy_if_exists(metric_path, metric_backup)
-        copy_if_exists(result_path, result_backup)
+        copy_if_exists(metric_path, metric_backup, overwrite=False)
+        copy_if_exists(result_path, result_backup, overwrite=False)
 
         candidate_results = []
         for selected in selected_candidates:
             selected_iter = selected["iteration"]
             if not iter_exists(scene_path, selected_iter):
                 print(f"[跳过] {scene_key}: 找不到保存点 iteration_{selected_iter}")
+                continue
+            cached_metrics = None if args.force_eval else read_cached_candidate(scene_path, selected_iter)
+            if cached_metrics is not None:
+                print(f"[缓存] {scene_key} @ {selected_iter} 使用 metric_best_{selected_iter}.txt")
+                candidate_results.append(
+                    {
+                        "iteration": selected_iter,
+                        "split": selected.get("split"),
+                        "curve_psnr": selected.get("psnr"),
+                        "cached": True,
+                        **cached_metrics,
+                    }
+                )
                 continue
             cmd = [sys.executable, str(eval_py), "-m", str(scene_path), "--iteration", str(selected_iter)]
             if dataset != "RefReal":
@@ -211,8 +244,7 @@ def main():
             subprocess.run(cmd, check=True)
 
             metrics = read_metric(metric_path)
-            best_metric_path = scene_path / f"metric_best_{selected_iter}.txt"
-            best_result_path = scene_path / f"results_best_{selected_iter}.json"
+            best_metric_path, best_result_path = cache_paths(scene_path, selected_iter)
             copy_if_exists(metric_path, best_metric_path)
             copy_if_exists(result_path, best_result_path)
             candidate_results.append(
@@ -220,6 +252,7 @@ def main():
                     "iteration": selected_iter,
                     "split": selected.get("split"),
                     "curve_psnr": selected.get("psnr"),
+                    "cached": False,
                     **metrics,
                 }
             )
@@ -230,7 +263,10 @@ def main():
 
         if not candidate_results:
             continue
-        best_candidate = max(candidate_results, key=lambda item: item.get("psnr", float("-inf")))
+        if args.selection_mode == "curve":
+            best_candidate = candidate_results[0]
+        else:
+            best_candidate = max(candidate_results, key=lambda item: item.get("psnr", float("-inf")))
 
         rows.append(
             {
@@ -245,12 +281,15 @@ def main():
                 "curve_final_psnr": final["psnr"],
                 "curve_drop": drop,
                 "offline_candidates": candidate_results,
+                "selection_mode": args.selection_mode,
+                "used_cache": all(candidate.get("cached", False) for candidate in candidate_results),
                 **{key: best_candidate[key] for key in METRIC_KEYS if key in best_candidate},
             }
         )
 
-    summary_path = output_dir / "best_iteration_eval_summary.txt"
-    json_path = output_dir / "best_iteration_eval_summary.json"
+    suffix = f"_{args.summary_suffix}" if args.summary_suffix else ""
+    summary_path = output_dir / f"best_iteration_eval_summary{suffix}.txt"
+    json_path = output_dir / f"best_iteration_eval_summary{suffix}.json"
     averages = {}
     for key in METRIC_KEYS:
         vals = [row[key] for row in rows if key in row]
@@ -259,6 +298,8 @@ def main():
         f.write("=" * 120 + "\n")
         f.write(f"Best-Iteration Offline Evaluation: {output_dir}\n")
         f.write(f"Selection splits: {', '.join(select_splits)}\n")
+        f.write(f"Selection mode: {args.selection_mode}\n")
+        f.write(f"Resume cache: {'off (--force-eval)' if args.force_eval else 'on (metric_best_ITER.txt)'}\n")
         if args.min_iteration is not None or args.max_iteration is not None:
             f.write(f"Iteration range: {args.min_iteration if args.min_iteration is not None else '-inf'} to {args.max_iteration if args.max_iteration is not None else '+inf'}\n")
         f.write("=" * 120 + "\n")
@@ -286,8 +327,11 @@ def main():
             {
                 "output_dir": str(output_dir),
                 "select_splits": select_splits,
+                "selection_mode": args.selection_mode,
+                "summary_suffix": args.summary_suffix,
                 "min_iteration": args.min_iteration,
                 "max_iteration": args.max_iteration,
+                "force_eval": args.force_eval,
                 "averages": averages,
                 "scenes": rows,
             },

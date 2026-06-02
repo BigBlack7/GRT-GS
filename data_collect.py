@@ -69,7 +69,11 @@ def parse_eval_curve(curve_path):
 
 
 def canonical_test_curve(curve_rows):
-    priority = {"test": 3, "test_fast": 2}
+    has_val = any(row["split"] in {"val", "val_fast"} for row in curve_rows)
+    if has_val:
+        priority = {"val": 4, "val_fast": 3}
+    else:
+        priority = {"test": 3, "test_fast": 2}
     best = {}
     for row in curve_rows:
         if row["split"] not in priority:
@@ -127,7 +131,7 @@ def write_curve_svg(svg_path, title, curve_rows):
 
     grouped = {}
     for row in curve_rows:
-        if row["split"] not in {"test_fast", "test", "train"}:
+        if row["split"] not in {"val_fast", "val", "test_fast", "test", "train"}:
             continue
         grouped.setdefault(row["split"], []).append(row)
     if not grouped:
@@ -135,7 +139,13 @@ def write_curve_svg(svg_path, title, curve_rows):
     for rows in grouped.values():
         rows.sort(key=lambda item: item["iteration"])
 
-    colors = {"test_fast": "#2563eb", "test": "#16a34a", "train": "#d97706"}
+    colors = {
+        "val_fast": "#7c3aed",
+        "val": "#9333ea",
+        "test_fast": "#2563eb",
+        "test": "#16a34a",
+        "train": "#d97706",
+    }
     width, height = 920, 420
     left, right, top, bottom = 66, 24, 36, 56
     plot_w = width - left - right

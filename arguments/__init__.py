@@ -80,6 +80,9 @@ class ModelParams(ParamGroup):
         self.lod = 0
         self.llffhold = 8
         self.undistorted = False
+        self.val_hold = 0
+        self.val_offset = 0
+        self.val_max = 8
 
         # EnvLight Settings
         self.envmap_max_res = 128
@@ -133,6 +136,9 @@ class OptimizationParams(ParamGroup):
 
         self.envmap_cubemap_lr = 0.01
         self.ncif_lr = 0.002
+        self.probe_lr = 0.002
+        self.prt_lr = 0.001
+        self.prt_occlusion_lr = 0.001
         
         # Densification Settings
         self.percent_dense = 0.01
@@ -147,6 +153,13 @@ class OptimizationParams(ParamGroup):
         self.lambda_ncif_magnitude = 0.001
         self.lambda_env_tv = 0.0001
         self.lambda_env_energy = 0.0001
+        self.lambda_probe_smooth = 0.003
+        self.lambda_probe_energy = 0.0001
+        self.lambda_probe_magnitude = 0.001
+        self.lambda_prt_smooth = 0.001
+        self.lambda_prt_energy = 0.0001
+        self.lambda_prt_magnitude = 0.001
+        self.lambda_prt_occlusion = 0.0001
 
 
         # initial values
@@ -184,6 +197,22 @@ class OptimizationParams(ParamGroup):
         self.ncif_ramp_iters = 5000
         self.ncif_diffuse_mu = 1.0
         self.ncif_diffuse_nu = 1.0
+        self.use_probe_gi = False
+        self.probe_from_iter = 5000
+        self.probe_tau = 0.12
+        self.probe_ramp_iters = 5000
+        self.probe_grid_res = 8
+        self.probe_sh_degree = 2
+        self.probe_diffuse_mu = 1.0
+        self.probe_diffuse_nu = 1.0
+        self.use_prt_gs = False
+        self.prt_from_iter = 5000
+        self.prt_tau = 0.12
+        self.prt_ramp_iters = 5000
+        self.prt_sh_degree = 2
+        self.prt_diffuse_mu = 1.0
+        self.prt_diffuse_nu = 1.0
+        self.prt_occlusion_init = 0.75
         self.use_r2if = True
         self.r2if_specular_alpha = 1.0
         self.r2if_specular_beta = 1.0
@@ -197,6 +226,12 @@ class OptimizationParams(ParamGroup):
         self.oaf_max_blend = 0.35
         self.use_pcc = True
         self.pcc_keep_ratio = 0.75
+        self.use_adaptive_pcc = False
+        self.pcc_min_keep = 0.45
+        self.pcc_max_keep = 0.85
+        self.pcc_opacity_weight = 0.7
+        self.pcc_specular_weight = 0.3
+        self.pcc_confidence_gamma = 1.0
         self.use_cgi = True
         self.cgi_ramp_iters = 5000
                 

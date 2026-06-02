@@ -91,13 +91,23 @@ python eval.py -m <OUT>/physnorm --white_background --save_images --no_indirect
 
 ## 批量训练
 
-`train.sh` 已按当前 proposal 更新为 NCIF/R2IF/PCC/CGI 参数。直接运行：
+当前保留的训练入口如下：
+
+- `train.sh`：原始批量训练命令集合，主要用于和早期实验对照。
+- `train_step_0.sh`：Ref-Gaussian baseline 全场景诊断。
+- `train_step_8_pcc_val.sh`：固定 `PCC=0.65` 强基准，使用 validation top-1 选点。
+- `train_step_5.sh`：GIP-1 grid probe 消融入口。当前实验结论是不进入默认主线，仅用于复现和对照。
+- `train_step_9_prt.sh`：PRT-GS / Gaussian Radiance Transfer 首轮关键场景实验。
+
+运行示例：
 
 ```bash
 sh train.sh
+bash train_step_8_pcc_val.sh
+bash train_step_9_prt.sh
 ```
 
-路径需要根据本机数据集位置调整。
+路径需要根据本机数据集位置调整。旧的 sweep/fix/debug step 脚本已经清理，相关实验结论记录在 `Experiment.md`。
 
 ## 代码清理状态
 

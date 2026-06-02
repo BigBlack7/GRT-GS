@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import torch.nn.functional as F
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -102,6 +103,14 @@ class GaussianModel:
         self._normal1 = torch.empty(0)
         self._normal2 = torch.empty(0)
         self._ncif_dir = torch.empty(0)
+        self._probe_grid = torch.empty(0)
+        self._probe_aabb_min = torch.empty(0)
+        self._probe_aabb_max = torch.empty(0)
+        self.probe_grid_res = 0
+        self.probe_sh_degree = 0
+        self._prt_lighting = torch.empty(0)
+        self._prt_occlusion = torch.empty(0)
+        self.prt_sh_degree = 0
 
         self.optimizer = None
         self.free_radius = 0    
@@ -125,6 +134,7 @@ class GaussianModel:
 
     def capture(self):
         return (
+            "physnorm_prt_v1",
             self.active_sh_degree,
             self._xyz,
             self._refl_strength, 
@@ -148,10 +158,81 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self._ncif_dir,
+            self._probe_grid,
+            self._probe_aabb_min,
+            self._probe_aabb_max,
+            self.probe_grid_res,
+            self.probe_sh_degree,
+            self._prt_lighting,
+            self._prt_occlusion,
+            self.prt_sh_degree,
         )
     
     def restore(self, model_args, training_args):
-        if len(model_args) > 0 and model_args[0] == "physnorm_no_metal_v1":
+        if len(model_args) > 0 and model_args[0] == "physnorm_prt_v1":
+            (_version,
+            self.active_sh_degree,
+            self._xyz,
+            self._refl_strength,
+            self._metalness,
+            self._roughness,
+            self._ori_color,
+            self._diffuse_color,
+            self._features_dc,
+            self._features_rest,
+            self._indirect_dc,
+            self._indirect_rest,
+            self._indirect_asg,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal1,
+            self._normal2,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._ncif_dir,
+            self._probe_grid,
+            self._probe_aabb_min,
+            self._probe_aabb_max,
+            self.probe_grid_res,
+            self.probe_sh_degree,
+            self._prt_lighting,
+            self._prt_occlusion,
+            self.prt_sh_degree) = model_args
+        elif len(model_args) > 0 and model_args[0] == "physnorm_probe_v1":
+            (_version,
+            self.active_sh_degree,
+            self._xyz,
+            self._refl_strength,
+            self._metalness,
+            self._roughness,
+            self._ori_color,
+            self._diffuse_color,
+            self._features_dc,
+            self._features_rest,
+            self._indirect_dc,
+            self._indirect_rest,
+            self._indirect_asg,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal1,
+            self._normal2,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._ncif_dir,
+            self._probe_grid,
+            self._probe_aabb_min,
+            self._probe_aabb_max,
+            self.probe_grid_res,
+            self.probe_sh_degree) = model_args
+        elif len(model_args) > 0 and model_args[0] == "physnorm_no_metal_v1":
             (_version,
             self.active_sh_degree,
             self._xyz,
@@ -281,6 +362,14 @@ class GaussianModel:
         self._indirect_asg = nn.Parameter(torch.zeros(self._rotation.shape[0], 32, 5, device='cuda').requires_grad_(True))
         if not isinstance(self._ncif_dir, nn.Parameter):
             self._ncif_dir = nn.Parameter(self._ncif_dir.to("cuda").requires_grad_(True))
+        if self._probe_grid.numel() > 0 and not isinstance(self._probe_grid, nn.Parameter):
+            self._probe_grid = nn.Parameter(self._probe_grid.to("cuda").requires_grad_(True))
+            self._probe_aabb_min = self._probe_aabb_min.to("cuda")
+            self._probe_aabb_max = self._probe_aabb_max.to("cuda")
+        if self._prt_lighting.numel() > 0 and not isinstance(self._prt_lighting, nn.Parameter):
+            self._prt_lighting = nn.Parameter(self._prt_lighting.to("cuda").requires_grad_(True))
+        if self._prt_occlusion.numel() > 0 and not isinstance(self._prt_occlusion, nn.Parameter):
+            self._prt_occlusion = nn.Parameter(self._prt_occlusion.to("cuda").requires_grad_(True))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -331,6 +420,162 @@ class GaussianModel:
         if not self.use_ncif or self._ncif_dir.numel() == 0:
             return None
         return self._ncif_dir
+
+    def _probe_num_coeffs(self, degree):
+        return (int(degree) + 1) ** 2
+
+    def _init_probe_field(self, training_args):
+        if not getattr(training_args, "use_probe_gi", False):
+            return
+        if self._probe_grid.numel() > 0:
+            if not isinstance(self._probe_grid, nn.Parameter):
+                self._probe_grid = nn.Parameter(self._probe_grid.to("cuda").requires_grad_(True))
+            return
+
+        res = max(2, int(getattr(training_args, "probe_grid_res", 8)))
+        degree = max(0, min(2, int(getattr(training_args, "probe_sh_degree", 2))))
+        coeffs = self._probe_num_coeffs(degree)
+        with torch.no_grad():
+            xyz = self.get_xyz.detach()
+            aabb_min = xyz.amin(dim=0)
+            aabb_max = xyz.amax(dim=0)
+            extent = (aabb_max - aabb_min).clamp_min(1e-4)
+            padding = extent.max() * 0.05
+            self._probe_aabb_min = (aabb_min - padding).to("cuda")
+            self._probe_aabb_max = (aabb_max + padding).to("cuda")
+
+        grid = torch.zeros((res, res, res, coeffs, 3), dtype=torch.float, device="cuda")
+        self._probe_grid = nn.Parameter(grid.requires_grad_(True))
+        self.probe_grid_res = res
+        self.probe_sh_degree = degree
+
+    def has_probe_field(self):
+        return self._probe_grid.numel() > 0 and self._probe_aabb_min.numel() == 3 and self._probe_aabb_max.numel() == 3
+
+    def _probe_sh_basis(self, normals, degree):
+        normals = F.normalize(normals, dim=-1, eps=1e-6)
+        x, y, z = normals.unbind(dim=-1)
+        basis = [torch.ones_like(x) * 0.28209479177387814]
+        if degree >= 1:
+            basis.extend([
+                -0.4886025119029199 * y,
+                0.4886025119029199 * z,
+                -0.4886025119029199 * x,
+            ])
+        if degree >= 2:
+            basis.extend([
+                1.0925484305920792 * x * y,
+                -1.0925484305920792 * y * z,
+                0.31539156525252005 * (3.0 * z * z - 1.0),
+                -1.0925484305920792 * x * z,
+                0.5462742152960396 * (x * x - y * y),
+            ])
+        return torch.stack(basis, dim=-1)
+
+    def _trilinear_probe_coeffs(self, xyz):
+        res = int(self.probe_grid_res)
+        grid = self._probe_grid
+        denom = (self._probe_aabb_max - self._probe_aabb_min).clamp_min(1e-6)
+        coord = ((xyz - self._probe_aabb_min) / denom).clamp(0.0, 1.0) * (res - 1)
+        idx0 = torch.floor(coord).long().clamp(0, res - 1)
+        idx1 = (idx0 + 1).clamp(0, res - 1)
+        frac = (coord - idx0.float()).view(-1, 3, 1, 1)
+
+        x0, y0, z0 = idx0[:, 0], idx0[:, 1], idx0[:, 2]
+        x1, y1, z1 = idx1[:, 0], idx1[:, 1], idx1[:, 2]
+        wx, wy, wz = frac[:, 0], frac[:, 1], frac[:, 2]
+
+        c000 = grid[x0, y0, z0]
+        c100 = grid[x1, y0, z0]
+        c010 = grid[x0, y1, z0]
+        c110 = grid[x1, y1, z0]
+        c001 = grid[x0, y0, z1]
+        c101 = grid[x1, y0, z1]
+        c011 = grid[x0, y1, z1]
+        c111 = grid[x1, y1, z1]
+
+        c00 = c000 * (1.0 - wx) + c100 * wx
+        c10 = c010 * (1.0 - wx) + c110 * wx
+        c01 = c001 * (1.0 - wx) + c101 * wx
+        c11 = c011 * (1.0 - wx) + c111 * wx
+        c0 = c00 * (1.0 - wy) + c10 * wy
+        c1 = c01 * (1.0 - wy) + c11 * wy
+        return c0 * (1.0 - wz) + c1 * wz
+
+    def get_probe_irradiance(self, xyz, normals, opt=None):
+        if not self.has_probe_field():
+            return None
+        degree = int(self.probe_sh_degree)
+        coeffs = self._trilinear_probe_coeffs(xyz)
+        basis = self._probe_sh_basis(normals, degree)
+        return (coeffs * basis[..., None]).sum(dim=1)
+
+    def probe_smoothness_loss(self):
+        if not self.has_probe_field():
+            return torch.zeros((), device="cuda")
+        grid = self._probe_grid
+        loss = (grid[1:, :, :, :, :] - grid[:-1, :, :, :, :]).abs().mean()
+        loss = loss + (grid[:, 1:, :, :, :] - grid[:, :-1, :, :, :]).abs().mean()
+        loss = loss + (grid[:, :, 1:, :, :] - grid[:, :, :-1, :, :]).abs().mean()
+        return loss / 3.0
+
+    def probe_energy_loss(self):
+        if not self.has_probe_field():
+            return torch.zeros((), device="cuda")
+        return self._probe_grid.pow(2).mean()
+
+    def _prt_num_coeffs(self, degree):
+        return (int(degree) + 1) ** 2
+
+    def _init_prt_field(self, training_args):
+        if self._prt_occlusion.numel() == 0 and self.get_xyz.numel() > 0:
+            init_occ = float(getattr(training_args, "prt_occlusion_init", 0.75))
+            init_occ = max(1e-4, min(1.0 - 1e-4, init_occ))
+            occ = torch.ones((self.get_xyz.shape[0], 1), device="cuda") * init_occ
+            self._prt_occlusion = nn.Parameter(self.inverse_opacity_activation(occ).requires_grad_(True))
+        elif self._prt_occlusion.numel() > 0 and not isinstance(self._prt_occlusion, nn.Parameter):
+            self._prt_occlusion = nn.Parameter(self._prt_occlusion.to("cuda").requires_grad_(True))
+
+        if not getattr(training_args, "use_prt_gs", False):
+            return
+        if self._prt_lighting.numel() > 0:
+            if not isinstance(self._prt_lighting, nn.Parameter):
+                self._prt_lighting = nn.Parameter(self._prt_lighting.to("cuda").requires_grad_(True))
+            return
+
+        degree = max(0, min(2, int(getattr(training_args, "prt_sh_degree", 2))))
+        coeffs = self._prt_num_coeffs(degree)
+        lighting = torch.zeros((coeffs, 3), dtype=torch.float, device="cuda")
+        self._prt_lighting = nn.Parameter(lighting.requires_grad_(True))
+        self.prt_sh_degree = degree
+
+    def has_prt_field(self):
+        return self._prt_lighting.numel() > 0 and self._prt_occlusion.numel() > 0
+
+    @property
+    def get_prt_occlusion(self):
+        if self._prt_occlusion.numel() == 0:
+            return None
+        return torch.sigmoid(self._prt_occlusion)
+
+    def get_prt_irradiance(self, normals, opt=None):
+        if not self.has_prt_field():
+            return None
+        degree = int(self.prt_sh_degree)
+        basis = self._probe_sh_basis(normals, degree)
+        lighting = (basis[..., None] * self._prt_lighting[None]).sum(dim=1)
+        occlusion = self.get_prt_occlusion
+        return lighting * occlusion
+
+    def prt_energy_loss(self):
+        if not self.has_prt_field():
+            return torch.zeros((), device="cuda")
+        return self._prt_lighting.pow(2).mean()
+
+    def prt_occlusion_loss(self):
+        if self._prt_occlusion.numel() == 0:
+            return torch.zeros((), device="cuda")
+        return (1.0 - self.get_prt_occlusion).abs().mean()
     
 
     def get_normal(self, scaling_modifier, dir_pp_normalized, return_delta=False): 
@@ -465,6 +710,8 @@ class GaussianModel:
         self._normal2 = nn.Parameter(torch.from_numpy(normals2).to(self._xyz.device).requires_grad_(True))
         ncif_dir = torch.zeros((self._xyz.shape[0], 3), device="cuda")
         self._ncif_dir = nn.Parameter(ncif_dir.requires_grad_(True))
+        prt_occ = torch.ones((self._xyz.shape[0], 1), device="cuda") * 0.75
+        self._prt_occlusion = nn.Parameter(self.inverse_opacity_activation(prt_occ).requires_grad_(True))
 
         self.env_map = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
         self.env_map_2 = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
@@ -475,6 +722,8 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._init_probe_field(training_args)
+        self._init_prt_field(training_args)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -505,6 +754,15 @@ class GaussianModel:
         if self._ncif_dir.numel() > 0:
             ncif_lr = training_args.ncif_lr if self.use_ncif else 0.0
             l.append({'params': [self._ncif_dir], 'lr': ncif_lr, "name": "ncif_dir"})
+        if self.has_probe_field():
+            probe_lr = training_args.probe_lr if getattr(training_args, "use_probe_gi", False) else 0.0
+            l.append({'params': [self._probe_grid], 'lr': probe_lr, "name": "probe_grid"})
+        if self._prt_lighting.numel() > 0:
+            prt_lr = training_args.prt_lr if getattr(training_args, "use_prt_gs", False) else 0.0
+            l.append({'params': [self._prt_lighting], 'lr': prt_lr, "name": "prt_lighting"})
+        if self._prt_occlusion.numel() > 0:
+            occ_lr = training_args.prt_occlusion_lr if getattr(training_args, "use_prt_gs", False) else 0.0
+            l.append({'params': [self._prt_occlusion], 'lr': occ_lr, "name": "prt_occlusion"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -541,6 +799,8 @@ class GaussianModel:
             l.append('diffuse_color_{}'.format(i))
         for i in range(self._ncif_dir.shape[1]):
             l.append('ncif_dir_{}'.format(i))
+        for i in range(self._prt_occlusion.shape[1]):
+            l.append('prt_occlusion_{}'.format(i))
 
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -564,6 +824,7 @@ class GaussianModel:
         ori_color = self._ori_color.detach().cpu().numpy()    
         diffuse_color = self._diffuse_color.detach().cpu().numpy()  
         ncif_dir = self._ncif_dir.detach().cpu().numpy()
+        prt_occlusion = self._prt_occlusion.detach().cpu().numpy()
         
         normals1 = self._normal1.detach().cpu().numpy()
         normals2 = self._normal2.detach().cpu().numpy() 
@@ -576,7 +837,7 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
 
-        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, ncif_dir, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, ncif_dir, prt_occlusion, scale, rotation), axis=1)
 
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
@@ -589,6 +850,29 @@ class GaussianModel:
         if self.env_map_2 is not None:
             save_path = path.replace('.ply', '2.map')
             torch.save(self.env_map_2.state_dict(), save_path)
+
+        if self.has_probe_field():
+            save_path = path.replace('.ply', '.probe')
+            torch.save(
+                {
+                    "probe_grid": self._probe_grid.detach().cpu(),
+                    "probe_aabb_min": self._probe_aabb_min.detach().cpu(),
+                    "probe_aabb_max": self._probe_aabb_max.detach().cpu(),
+                    "probe_grid_res": int(self.probe_grid_res),
+                    "probe_sh_degree": int(self.probe_sh_degree),
+                },
+                save_path,
+            )
+
+        if self.has_prt_field():
+            save_path = path.replace('.ply', '.prt')
+            torch.save(
+                {
+                    "prt_lighting": self._prt_lighting.detach().cpu(),
+                    "prt_sh_degree": int(self.prt_sh_degree),
+                },
+                save_path,
+            )
 
     def reset_opacity0(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -747,6 +1031,10 @@ class GaussianModel:
 
     def _blend01(self, current_value, reset_value, keep_ratio):
         target = torch.full_like(current_value, reset_value, dtype=torch.float, device="cuda")
+        if torch.is_tensor(keep_ratio):
+            keep_ratio = keep_ratio.to(device=current_value.device, dtype=current_value.dtype)
+            while keep_ratio.dim() < current_value.dim():
+                keep_ratio = keep_ratio.unsqueeze(-1)
         return torch.clamp(current_value * keep_ratio + target * (1.0 - keep_ratio), 1e-4, 1.0 - 1e-4)
 
     def soft_reset_ori_color(self, reset_value=0.5, keep_ratio=0.75):
@@ -806,6 +1094,15 @@ class GaussianModel:
                 ncif_dir[:, idx] = np.asarray(plydata.elements[0][attr_name])
         else:
             ncif_dir = np.zeros((xyz.shape[0], 3))
+        prt_occ_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("prt_occlusion_")]
+        prt_occ_names = sorted(prt_occ_names, key=lambda x: int(x.split('_')[-1]))
+        if prt_occ_names:
+            prt_occlusion = np.zeros((xyz.shape[0], len(prt_occ_names)))
+            for idx, attr_name in enumerate(prt_occ_names):
+                prt_occlusion[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        else:
+            init_occ = inverse_sigmoid(torch.tensor([0.75])).item()
+            prt_occlusion = np.ones((xyz.shape[0], 1)) * init_occ
         
         roughness = np.asarray(plydata.elements[0]["roughness"])[..., np.newaxis] # #
         metalness = np.asarray(plydata.elements[0]["metalness"])[..., np.newaxis] # #
@@ -882,6 +1179,30 @@ class GaussianModel:
             map_path = path.replace('.ply', '.hdr')
             self.env_map = EnvLight(path=map_path, device='cuda', trainable=True).cuda()
 
+        probe_path = path.replace('.ply', '.probe')
+        if os.path.exists(probe_path):
+            probe_state = torch.load(probe_path, map_location="cuda")
+            self._probe_grid = nn.Parameter(probe_state["probe_grid"].to("cuda").float().requires_grad_(True))
+            self._probe_aabb_min = probe_state["probe_aabb_min"].to("cuda").float()
+            self._probe_aabb_max = probe_state["probe_aabb_max"].to("cuda").float()
+            self.probe_grid_res = int(probe_state.get("probe_grid_res", self._probe_grid.shape[0]))
+            self.probe_sh_degree = int(probe_state.get("probe_sh_degree", int(round(self._probe_grid.shape[-2] ** 0.5)) - 1))
+        else:
+            self._probe_grid = torch.empty(0, device="cuda")
+            self._probe_aabb_min = torch.empty(0, device="cuda")
+            self._probe_aabb_max = torch.empty(0, device="cuda")
+            self.probe_grid_res = 0
+            self.probe_sh_degree = 0
+
+        prt_path = path.replace('.ply', '.prt')
+        if os.path.exists(prt_path):
+            prt_state = torch.load(prt_path, map_location="cuda")
+            self._prt_lighting = nn.Parameter(prt_state["prt_lighting"].to("cuda").float().requires_grad_(True))
+            self.prt_sh_degree = int(prt_state.get("prt_sh_degree", int(round(self._prt_lighting.shape[0] ** 0.5)) - 1))
+        else:
+            self._prt_lighting = torch.empty(0, device="cuda")
+            self.prt_sh_degree = 0
+
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._refl_strength = nn.Parameter(torch.tensor(refl_strength, dtype=torch.float, device="cuda").requires_grad_(True))   # #
@@ -890,6 +1211,7 @@ class GaussianModel:
         self._ori_color = nn.Parameter(torch.tensor(ori_color, dtype=torch.float, device="cuda").requires_grad_(True))   # #
         self._diffuse_color = nn.Parameter(torch.tensor(diffuse_color, dtype=torch.float, device="cuda").requires_grad_(True))   # #
         self._ncif_dir = nn.Parameter(torch.tensor(ncif_dir, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._prt_occlusion = nn.Parameter(torch.tensor(prt_occlusion, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._normal1 = nn.Parameter(torch.tensor(normal1, dtype=torch.float, device="cuda").requires_grad_(True))       # #
         self._normal2 = nn.Parameter(torch.tensor(normal2, dtype=torch.float, device="cuda").requires_grad_(True))       # #
@@ -924,7 +1246,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] in {"mlp", "env", "env2"}:
+            if group["name"] in {"mlp", "env", "env2", "probe_grid", "prt_lighting"}:
                 continue   # #
             stored_state = self.optimizer.state.get(group['params'][0], None)
 
@@ -957,6 +1279,8 @@ class GaussianModel:
         self._normal2 = optimizable_tensors["normal2"]        # #
         if "ncif_dir" in optimizable_tensors:
             self._ncif_dir = optimizable_tensors["ncif_dir"]
+        if "prt_occlusion" in optimizable_tensors:
+            self._prt_occlusion = optimizable_tensors["prt_occlusion"]
 
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -974,7 +1298,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] in {"mlp", "env", "env2"}:
+            if group["name"] in {"mlp", "env", "env2", "probe_grid", "prt_lighting"}:
                 continue   # #
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -995,7 +1319,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
+    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
         d = {"xyz": new_xyz,
              
         "refl_strength": new_refl_strength,    # #
@@ -1004,6 +1328,7 @@ class GaussianModel:
         "ori_color": new_ori_color,    # #
         "diffuse_color": new_diffuse_color,    # #
         "ncif_dir": new_ncif_dir,
+        "prt_occlusion": new_prt_occlusion,
         "normal1" : new_normal1,       # #
         "normal2" : new_normal2,       # #
 
@@ -1028,6 +1353,8 @@ class GaussianModel:
         self._diffuse_color = optimizable_tensors['diffuse_color']    # #
         if "ncif_dir" in optimizable_tensors:
             self._ncif_dir = optimizable_tensors["ncif_dir"]
+        if "prt_occlusion" in optimizable_tensors:
+            self._prt_occlusion = optimizable_tensors["prt_occlusion"]
         self._normal1 = optimizable_tensors["normal1"]        # #
         self._normal2 = optimizable_tensors["normal2"]        # #
 
@@ -1067,6 +1394,7 @@ class GaussianModel:
         new_ori_color = self._ori_color[selected_pts_mask].repeat(N,1)   # #
         new_diffuse_color = self._diffuse_color[selected_pts_mask].repeat(N,1)   # #
         new_ncif_dir = self._ncif_dir[selected_pts_mask].repeat(N,1)
+        new_prt_occlusion = self._prt_occlusion[selected_pts_mask].repeat(N,1)
         new_roughness = self._roughness[selected_pts_mask].repeat(N,1)   # #
         new_metalness = self._metalness[selected_pts_mask].repeat(N,1)   # #
         new_normal1 = self._normal1[selected_pts_mask].repeat(N,1)        # #
@@ -1081,7 +1409,7 @@ class GaussianModel:
         
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1100,6 +1428,7 @@ class GaussianModel:
         new_ori_color = self._ori_color[selected_pts_mask]   # #
         new_diffuse_color = self._diffuse_color[selected_pts_mask]   # #
         new_ncif_dir = self._ncif_dir[selected_pts_mask]
+        new_prt_occlusion = self._prt_occlusion[selected_pts_mask]
         new_normal1 = self._normal1[selected_pts_mask]       # #
         new_normal2 = self._normal2[selected_pts_mask]       # #
 
@@ -1114,7 +1443,7 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

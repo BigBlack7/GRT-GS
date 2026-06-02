@@ -40,6 +40,14 @@ def _ncif_tau(opt):
     return _schedule_weight(opt, "ncif_from_iter", "ncif_ramp_iters", float(getattr(opt, "ncif_tau", 0.0)))
 
 
+def _probe_tau(opt):
+    return _schedule_weight(opt, "probe_from_iter", "probe_ramp_iters", float(getattr(opt, "probe_tau", 0.0)))
+
+
+def _prt_tau(opt):
+    return _schedule_weight(opt, "prt_from_iter", "prt_ramp_iters", float(getattr(opt, "prt_tau", 0.0)))
+
+
 def _oaf_tau(opt):
     return _schedule_weight(opt, "oaf_from_iter", "oaf_ramp_iters", float(getattr(opt, "oaf_tau", 0.0)))
 
@@ -78,6 +86,18 @@ def _diffuse_responsibility(refl_strength, roughness, opt=None):
     return (1.0 - refl_strength.clamp(0.0, 1.0)).pow(mu) * roughness.clamp(0.0, 1.0).pow(nu)
 
 
+def _probe_diffuse_responsibility(refl_strength, roughness, opt=None):
+    mu = float(getattr(opt, "probe_diffuse_mu", 1.0)) if opt is not None else 1.0
+    nu = float(getattr(opt, "probe_diffuse_nu", 1.0)) if opt is not None else 1.0
+    return (1.0 - refl_strength.clamp(0.0, 1.0)).pow(mu) * roughness.clamp(0.0, 1.0).pow(nu)
+
+
+def _prt_diffuse_responsibility(refl_strength, roughness, opt=None):
+    mu = float(getattr(opt, "prt_diffuse_mu", 1.0)) if opt is not None else 1.0
+    nu = float(getattr(opt, "prt_diffuse_nu", 1.0)) if opt is not None else 1.0
+    return (1.0 - refl_strength.clamp(0.0, 1.0)).pow(mu) * roughness.clamp(0.0, 1.0).pow(nu)
+
+
 def _apply_ncif_diffuse(ref_diffuse, normal_map, ncif_map, refl_strength, roughness, opt=None):
     tau = _ncif_tau(opt)
     if tau <= 0.0:
@@ -85,6 +105,26 @@ def _apply_ncif_diffuse(ref_diffuse, normal_map, ncif_map, refl_strength, roughn
     raw = (normal_map * ncif_map).sum(dim=0, keepdim=True)
     responsibility = _diffuse_responsibility(refl_strength, roughness, opt)
     response = tau * responsibility * torch.tanh(raw)
+    diffuse = torch.clamp_min(ref_diffuse * (1.0 + response), 0.0)
+    return diffuse, response, responsibility
+
+
+def _apply_probe_diffuse(ref_diffuse, probe_map, refl_strength, roughness, opt=None):
+    tau = _probe_tau(opt)
+    if tau <= 0.0:
+        return ref_diffuse, None, None
+    responsibility = _probe_diffuse_responsibility(refl_strength, roughness, opt)
+    response = tau * responsibility * torch.tanh(probe_map)
+    diffuse = torch.clamp_min(ref_diffuse * (1.0 + response), 0.0)
+    return diffuse, response, responsibility
+
+
+def _apply_prt_diffuse(ref_diffuse, prt_map, refl_strength, roughness, opt=None):
+    tau = _prt_tau(opt)
+    if tau <= 0.0:
+        return ref_diffuse, None, None
+    responsibility = _prt_diffuse_responsibility(refl_strength, roughness, opt)
+    response = tau * responsibility * torch.tanh(prt_map)
     diffuse = torch.clamp_min(ref_diffuse * (1.0 + response), 0.0)
     return diffuse, response, responsibility
 
@@ -376,9 +416,21 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     enable_ncif = pc.use_ncif and getattr(opt, "enable_ncif", True)
     if enable_ncif:
         ncif_dir = pc.get_ncif_dir()
+    probe_rgb = None
+    enable_probe = getattr(opt, "enable_probe_gi", getattr(opt, "use_probe_gi", False))
+    if enable_probe and pc.has_probe_field():
+        probe_rgb = pc.get_probe_irradiance(pc.get_xyz, normals, opt)
+    prt_rgb = None
+    enable_prt = getattr(opt, "enable_prt_gs", getattr(opt, "use_prt_gs", False))
+    if enable_prt and pc.has_prt_field():
+        prt_rgb = pc.get_prt_irradiance(normals, opt)
     features = torch.cat((refl, roughness, ori_color, indirect), dim=-1)
     if ncif_dir is not None:
         features = torch.cat((features, ncif_dir), dim=-1)
+    if probe_rgb is not None:
+        features = torch.cat((features, probe_rgb), dim=-1)
+    if prt_rgb is not None:
+        features = torch.cat((features, prt_rgb), dim=-1)
     contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -393,14 +445,28 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
 
     base_color = rendered_image
-    refl_strength = rendered_features[:1]
+    cursor = 0
+    refl_strength = rendered_features[cursor:cursor + 1]
+    cursor += 1
     material_gate = _material_gate(refl_strength, opt)
-    roughness = rendered_features[1:2]
-    albedo = rendered_features[2:5]
-    indirect_light = rendered_features[5:8]
+    roughness = rendered_features[cursor:cursor + 1]
+    cursor += 1
+    albedo = rendered_features[cursor:cursor + 3]
+    cursor += 3
+    indirect_light = rendered_features[cursor:cursor + 3]
+    cursor += 3
     ncif_map = None
     if ncif_dir is not None:
-        ncif_map = rendered_features[8:11]
+        ncif_map = rendered_features[cursor:cursor + 3]
+        cursor += 3
+    probe_map = None
+    if probe_rgb is not None:
+        probe_map = rendered_features[cursor:cursor + 3]
+        cursor += 3
+    prt_map = None
+    if prt_rgb is not None:
+        prt_map = rendered_features[cursor:cursor + 3]
+        cursor += 3
 
 
     # 2DGS normal and regularizations
@@ -434,6 +500,14 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     ncif_responsibility = None
     if ncif_map is not None:
         diffuse_color, ncif_response, ncif_responsibility = _apply_ncif_diffuse(diffuse_color, normal_map_chw, ncif_map, refl_strength, roughness, opt)
+    probe_response = None
+    probe_responsibility = None
+    if probe_map is not None:
+        diffuse_color, probe_response, probe_responsibility = _apply_probe_diffuse(diffuse_color, probe_map, refl_strength, roughness, opt)
+    prt_response = None
+    prt_responsibility = None
+    if prt_map is not None:
+        diffuse_color, prt_response, prt_responsibility = _apply_prt_diffuse(diffuse_color, prt_map, refl_strength, roughness, opt)
     final_image = diffuse_color + specular
     oaf_blend = None
     final_image, oaf_blend = _apply_oaf(final_image, base_color, refl_strength, roughness, opt)
@@ -477,6 +551,14 @@ def render_surfel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         results.update({"ncif_map": ncif_map})
         if ncif_response is not None:
             results.update({"ncif_response": ncif_response, "ncif_responsibility": ncif_responsibility})
+    if probe_map is not None:
+        results.update({"probe_map": probe_map})
+        if probe_response is not None:
+            results.update({"probe_response": probe_response, "probe_responsibility": probe_responsibility})
+    if prt_map is not None:
+        results.update({"prt_map": prt_map})
+        if prt_response is not None:
+            results.update({"prt_response": prt_response, "prt_responsibility": prt_responsibility})
     if opt.indirect:
         results.update(extra_dict)
 
@@ -626,6 +708,16 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         ncif_dir = pc.get_ncif_dir()
         if ncif_dir is not None:
             features = torch.cat((features, ncif_dir), dim=-1)
+    probe_rgb = None
+    enable_probe = getattr(opt, "enable_probe_gi", getattr(opt, "use_probe_gi", False))
+    if enable_probe and pc.has_probe_field():
+        probe_rgb = pc.get_probe_irradiance(means3D, normals, opt)
+        features = torch.cat((features, probe_rgb), dim=-1)
+    prt_rgb = None
+    enable_prt = getattr(opt, "enable_prt_gs", getattr(opt, "use_prt_gs", False))
+    if enable_prt and pc.has_prt_field():
+        prt_rgb = pc.get_prt_irradiance(normals, opt)
+        features = torch.cat((features, prt_rgb), dim=-1)
 
     contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
         means3D = means3D,
@@ -642,21 +734,37 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     # get rendered diffuse color and other paras
     full_color = rendered_image     # (3,H,W)
-    render_roughness = rendered_features[:1]   # (1,H,W)
-    render_refl_strength = rendered_features[1:2]   # (1,H,W)
+    cursor = 0
+    render_roughness = rendered_features[cursor:cursor + 1]   # (1,H,W)
+    cursor += 1
+    render_refl_strength = rendered_features[cursor:cursor + 1]   # (1,H,W)
+    cursor += 1
     render_material_gate = _material_gate(render_refl_strength, opt)
-    render_diffuse_color = rendered_features[2:5]
-    render_specular_color = rendered_features[5:8]
-    render_ori_color = rendered_features[8:11]
+    render_diffuse_color = rendered_features[cursor:cursor + 3]
+    cursor += 3
+    render_specular_color = rendered_features[cursor:cursor + 3]
+    cursor += 3
+    render_ori_color = rendered_features[cursor:cursor + 3]
+    cursor += 3
     ncif_map = None
     if opt.indirect:
-        render_visibility = rendered_features[11:12]
-        render_indirect = rendered_features[12:15] 
-        render_direct = rendered_features[15:18]
-        if ncif_dir is not None:
-            ncif_map = rendered_features[18:21]
-    elif ncif_dir is not None:
-        ncif_map = rendered_features[11:14]
+        render_visibility = rendered_features[cursor:cursor + 1]
+        cursor += 1
+        render_indirect = rendered_features[cursor:cursor + 3]
+        cursor += 3
+        render_direct = rendered_features[cursor:cursor + 3]
+        cursor += 3
+    if ncif_dir is not None:
+        ncif_map = rendered_features[cursor:cursor + 3]
+        cursor += 3
+    probe_map = None
+    if probe_rgb is not None:
+        probe_map = rendered_features[cursor:cursor + 3]
+        cursor += 3
+    prt_map = None
+    if prt_rgb is not None:
+        prt_map = rendered_features[cursor:cursor + 3]
+        cursor += 3
 
 
 
@@ -678,6 +786,16 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         normal_map = render_normal / render_alpha.clamp_min(1e-6)
         normal_map = F.normalize(normal_map, dim=0, eps=1e-6)
         render_diffuse_color, ncif_response, ncif_responsibility = _apply_ncif_diffuse(render_diffuse_color, normal_map, ncif_map, render_refl_strength, render_roughness, opt)
+        full_color = render_diffuse_color + render_specular_color
+    probe_response = None
+    probe_responsibility = None
+    if probe_map is not None:
+        render_diffuse_color, probe_response, probe_responsibility = _apply_probe_diffuse(render_diffuse_color, probe_map, render_refl_strength, render_roughness, opt)
+        full_color = render_diffuse_color + render_specular_color
+    prt_response = None
+    prt_responsibility = None
+    if prt_map is not None:
+        render_diffuse_color, prt_response, prt_responsibility = _apply_prt_diffuse(render_diffuse_color, prt_map, render_refl_strength, render_roughness, opt)
         full_color = render_diffuse_color + render_specular_color
     oaf_blend = None
     full_color, oaf_blend = _apply_oaf(full_color, render_ori_color, render_refl_strength, render_roughness, opt)
@@ -722,6 +840,14 @@ def render_volume(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         results.update({"ncif_map": ncif_map})
         if ncif_response is not None:
             results.update({"ncif_response": ncif_response, "ncif_responsibility": ncif_responsibility})
+    if probe_map is not None:
+        results.update({"probe_map": probe_map})
+        if probe_response is not None:
+            results.update({"probe_response": probe_response, "probe_responsibility": probe_responsibility})
+    if prt_map is not None:
+        results.update({"prt_map": prt_map})
+        if prt_response is not None:
+            results.update({"prt_response": prt_response, "prt_responsibility": prt_responsibility})
     if opt.indirect:
         results.update(
             {
