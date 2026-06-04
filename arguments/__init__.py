@@ -67,7 +67,7 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
-        self.use_ncif = True
+        self.use_ncif = False
         
         # Paths
         self._source_path = ""
@@ -135,10 +135,10 @@ class OptimizationParams(ParamGroup):
         self.normal_lr = 0.006
 
         self.envmap_cubemap_lr = 0.01
-        self.ncif_lr = 0.002
+        self.ncif_lr = 0.0
         self.probe_lr = 0.002
-        self.prt_lr = 0.001
-        self.prt_occlusion_lr = 0.001
+        self.prt_lr = 0.0
+        self.prt_occlusion_lr = 0.0
         
         # Densification Settings
         self.percent_dense = 0.01
@@ -149,17 +149,17 @@ class OptimizationParams(ParamGroup):
         self.lambda_normal_render_depth = 0.05
         self.lambda_normal_smooth = 0.0
         self.lambda_depth_smooth = 0.0
-        self.lambda_ncif_smooth = 0.005
-        self.lambda_ncif_magnitude = 0.001
-        self.lambda_env_tv = 0.0001
-        self.lambda_env_energy = 0.0001
-        self.lambda_probe_smooth = 0.003
-        self.lambda_probe_energy = 0.0001
-        self.lambda_probe_magnitude = 0.001
-        self.lambda_prt_smooth = 0.001
-        self.lambda_prt_energy = 0.0001
-        self.lambda_prt_magnitude = 0.001
-        self.lambda_prt_occlusion = 0.0001
+        self.lambda_ncif_smooth = 0.0
+        self.lambda_ncif_magnitude = 0.0
+        self.lambda_env_tv = 0.0
+        self.lambda_env_energy = 0.0
+        self.lambda_probe_smooth = 0.0
+        self.lambda_probe_energy = 0.0
+        self.lambda_probe_magnitude = 0.0
+        self.lambda_prt_smooth = 0.0
+        self.lambda_prt_energy = 0.0
+        self.lambda_prt_magnitude = 0.0
+        self.lambda_prt_occlusion = 0.0
 
 
         # initial values
@@ -213,7 +213,26 @@ class OptimizationParams(ParamGroup):
         self.prt_diffuse_mu = 1.0
         self.prt_diffuse_nu = 1.0
         self.prt_occlusion_init = 0.75
-        self.use_r2if = True
+        self.use_grt = False
+        self.grt_from_iter = 20000
+        self.grt_tau = 1.0
+        self.grt_ramp_iters = 5000
+        self.grt_sh_degree = 2
+        self.grt_mode = "dot"
+        self.grt_transfer_lr = 0.001
+        self.grt_transfer_init = 1.0
+        self.use_grt_visibility_init = True
+        self.grt_visibility_rays = 64
+        self.grt_visibility_chunk = 4096
+        self.grt_visibility_eps = 0.02
+        self.grt_visibility_max_distance = 0.0
+        self.grt_transfer_refresh_interval = 0
+        self.grt_transfer_blend = 1.0
+        self.grt_transfer_clamp = 4.0
+        self.lambda_grt_smooth = 0.001
+        self.lambda_grt_energy = 0.0001
+        self.lambda_grt_transfer = 0.0001
+        self.use_r2if = False
         self.r2if_specular_alpha = 1.0
         self.r2if_specular_beta = 1.0
         self.r2if_min_specular_gate = 0.02
@@ -232,7 +251,7 @@ class OptimizationParams(ParamGroup):
         self.pcc_opacity_weight = 0.7
         self.pcc_specular_weight = 0.3
         self.pcc_confidence_gamma = 1.0
-        self.use_cgi = True
+        self.use_cgi = False
         self.cgi_ramp_iters = 5000
                 
         self.indirect = 0

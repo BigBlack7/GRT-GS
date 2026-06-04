@@ -1,20 +1,44 @@
-# OAH-GS 实验记录与阶段计划
+# GRT-GS 实验记录与阶段计划
 
 本文档只记录工程落地、训练脚本、阶段实验计划和阶段结论。理论方法、公式推导和论文叙事统一放在 `Proposal.md`。
 
 ---
 
+## 0. 当前收敛状态（2026-06-04）
+
+当前论文与工程主线已经固定为 **GRT-GS = DDGI Probe Radiance + TSDF/BVH-initialized Gaussian PRT Transfer + PCC**。
+
+当前主线只保留三项：
+
+1. **DDGI Probe Radiance**：空间 probe grid 学习低频入射辐射 SH 系数。
+2. **Gaussian PRT Transfer**：每个 Gaussian 学习低阶 SH 传输系数；默认先用 TSDF mesh + BVH 半球可见性拟合 transfer 初值，再与 probe radiance 做 SH 内积或方向查询。
+3. **PCC 固定软重置**：使用固定 `pcc_keep_ratio=0.65` 作为稳定训练辅助，不再继续做 APCC 自适应扫参。
+
+旧的 `NCIF / R2IF / CGI / OAF / GIP-0 / GIP-1 / old probe diffuse / old PRT diffuse` 不再进入主方法和当前训练主路径；相关章节只作为历史探索归档，不再作为下一轮实验依据。
+
+当前可跑脚本：
+
+```bash
+bash train_step_11_pcc_full.sh
+bash train_step_12_grt.sh
+bash train_step_13_grt_full.sh
+```
+
+GRT 参数搜索以 `train_step_12_grt.sh` 为准，优先对比固定 PCC 强基准和 Ref-Gaussian 30k 外部下限。
+
+---
+
 ## 1. 当前总路线
 
-当前项目从“Ref-Gaussian 主链路 + NCIF/R2IF/PCC/CGI 若干模块”升级为 **OAH-GS：Observability-Aware Hybrid Gaussian Splatting** 主线。新的核心判断是：
+当前项目从“Ref-Gaussian 主链路 + NCIF/R2IF/PCC/CGI 若干模块”收敛为 **GRT-GS：Gaussian Radiance Transfer for 3D Gaussian Inverse Rendering** 主线。新的核心判断是：
 
 1. 高频环境贴图适合表达远场镜面反射，不适合被漫反射区域强监督。
-2. 漫反射、弱反射和真实复杂区域应优先保留外观基底，再用低频 irradiance probes 做受控修正。
-3. 近场物体反射和互反射应由局部 ray tracing / local transport 解释。
-4. 当物理因子不可观测时，训练应安全回退到外观解释，而不是强行污染 envmap 或 local transport。
+2. 漫反射、弱反射和真实复杂区域需要空间连续的低频入射辐射场，而不是让每个 Gaussian 各自死记 learned indirect color。
+3. 近场可见性和局部遮挡应由 TSDF/BVH 显式几何转化为 Gaussian transfer 初值，再交给训练细化。
+4. 当物理因子不可观测时，PCC 保持阶段连续性，避免材质重置和 delayed rendering 切换造成优化突降。
 5. PCC 负责解决 delayed rendering 和材质重置带来的训练开倒车。
 
-因此后续工程不再把 NCIF 视为最终主创新，而把它视为 **GIP-0：per-Gaussian low-frequency irradiance proxy**。若 GIP-0 有效，继续实现真正的 **GIP-1：learnable grid irradiance probes**；若 GIP-0 对真实场景无效，则优先补充 appearance/exposure residual 和更稳的 anti-aliasing/geometry，再决定是否推进 DDGI-lite visibility。
+因此后续工程不再推进 NCIF/GIP/OAF/APCC 等历史分支，主实验只围绕 GRT 三部分展开：probe radiance、Gaussian transfer、PCC。
 
 当前实验目标也随之调整：不再要求所有场景都被同一个物理模块显著提升，而是验证 **反射场景有收益、非反射场景不伤害、真实场景更稳定、envmap 更干净**。
 
@@ -561,6 +585,403 @@ bash train_step_7_apcc_highkeep.sh
 
 下一步改为 **PRT 启发的 Gaussian Radiance Transfer**：不再学习密集空间 probe grid，而是把低频光照表示为共享 SH lighting，把每个 Gaussian 的局部传输表示为由法线、材质和少量可学习遮蔽/低秩系数控制的 transfer function。目标是保留 MGIP 的物理解释，同时降低训练成本并减少与颜色场抢解释权。
 
+### 2.17 Step 9 PRT-GS 首版实验回传结论
+
+用户已完成 `train_step_9_prt.sh`，输出目录为：
+
+```bash
+/data2/zmh/output_physnorm_steps/step9_prt_gs_30000_pcc065_tau012_mingate015_valhold8
+```
+
+严格 validation top-1 结果如下：
+
+| 场景 | PCC strict | PRT-GS strict | 差值 | Ref-Gaussian | 相对 Ref | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `bell` | 32.0101 | 32.4604 | +0.4503 | 25.08 | +7.38 | 明显正收益，且 final/strict 都稳定 |
+| `teapot` | 25.3106 | 26.3002 | +0.9896 | 25.40 | +0.90 | 当前最清晰正收益 |
+| `chair` | 33.7964 | 33.2518 | -0.5446 | 34.11 | -0.86 | strict 选点偏早；final 为 `33.8536`，接近 PCC |
+| `materials` | 30.6758 | 30.0999 | -0.5759 | 30.53 | -0.43 | 负收益，且存在早期 step-wise drop |
+| `ship` | 29.9910 | 30.0082 | +0.0172 | 30.12 | -0.11 | 基本持平 |
+| `sedan` | 24.8962 | 24.5122 | -0.3840 | 26.23 | -1.72 | strict 选点偏早；final 为 `25.8572`，但仍低于 Ref |
+| `toycar` | 24.6158 | 24.6260 | +0.0102 | 24.73 | -0.10 | 基本持平 |
+| `toaster` | 27.1872 | 27.0817 | -0.1055 | 25.89 | +1.19 | 明显好于 GIP-1，不再崩，但略低于 PCC |
+
+共同场景 strict 平均为 `28.5425 dB`，与固定 PCC strict 共同场景平均约 `28.5604 dB` 基本持平；final 平均为 `28.8515 dB`，也与固定 PCC final 共同场景均值约 `28.89 dB` 接近。相比 GIP-1 grid probe，PRT-GS 明显更稳定：`toaster` 从 GIP-1 strict 的 `25.3095` 恢复到 `27.0817`，训练/评估速度也从 GIP-1 的明显低速回到接近 Ref-Gaussian/PCC 的量级。
+
+效率观察：
+
+- Step 9 final FPS 平均为 `73.47`，strict eval 平均为 `87.34`。
+- Ref-Gaussian 在相同八个关键场景上的 FPS 粗略均值约为 `72.27`。
+- 因此当前观察到的“效率提升”可以认为是 PRT-GS 没有引入 dense grid probe 的额外开销，且可能因为点数/保存点/GPU 抖动略快；不能直接声称 PRT-GS 本身是加速模块。
+- 但可以明确说：PRT-GS 的计算代价远低于 GIP-1 grid probe，适合作为后续低频漫反射光照分解的主线。
+
+阶段结论：
+
+- PRT-GS 方向成立，但首版还不是稳定涨点模块。
+- 它相比 GIP-1 grid probe 的最大价值是 **效率和安全性**：不再显著拖慢真实场景，也不再严重破坏 `toaster` 这类反射控制场景。
+- 当前最大短板是 `materials/sedan/chair` 的 strict 选点和早期扰动。`materials` 的 final drop 为 0，但 `9000->10000` 出现 `2.96 dB` 的 step-wise drop，说明 PRT 在 delayed/volume 阶段过早参与可能干扰几何/材质收敛。
+- 下一步不急着加低秩 residual 或分区 lighting，而是先做 **PRT late-gated safety**：延迟启用 PRT、降低反射控制场景强度、提高粗糙度指数，确认它能否在不伤害 `materials/toaster/bell` 的前提下保留 `teapot/chair/toycar` 的收益。
+
+### 2.18 Step 10 PRT late-gated safety 实验计划
+
+Step 9 证明 PRT-GS 的方向比 GIP-1 grid probe 更安全、更高效，但首版 `prt_from_iter=3000/5000/8000` 仍然偏早。下一轮不改理论结构，先只改启用调度和门控强度，判断负收益是否来自过早参与优化。
+
+新增脚本：
+
+```bash
+bash train_step_10_prt_late.sh
+```
+
+默认输出：
+
+```bash
+/data2/zmh/output_physnorm_steps/step10_prt_late_30000_pcc065_tau010_nu15_mingate015_valhold8
+```
+
+相对 Step 9 的变化：
+
+| 类型 | Step 9 | Step 10 | 目的 |
+| --- | --- | --- | --- |
+| Diffuse/weak-reflective | `prt_from_iter=3000`, `tau=0.12`, `nu=1.0` | `prt_from_iter=12000`, `tau=0.10`, `nu=1.5` | 避免在 delayed/volume 阶段抢几何和材质解释权 |
+| Ref-Real | `prt_from_iter=5000`, `tau=0.12` | `prt_from_iter=10000`, `tau=0.08`, `nu=1.3` | 降低真实场景中不可观测残差写入 PRT 的风险 |
+| Reflective controls | `prt_from_iter=8000`, `tau=0.06` | `prt_from_iter=18000`, `tau=0.04`, `nu=2.0` | 保护高频镜面路径，只允许很弱的低频 diffuse 修正 |
+| 正则 | `magnitude=0.001`, `occlusion=0.0001` | `magnitude=0.002`, `occlusion=0.0002` | 抑制 PRT 变成任意颜色残差 |
+
+判断标准：
+
+- 若 `materials/chair/sedan` 的 strict 负收益明显收窄，同时 `bell/teapot/toaster` 不下降，则 Step 10 成为新的 PRT 默认实现。
+- 若 `teapot/bell` 收益被弱化但 `materials/chair` 仍不恢复，说明问题不是启用时机，而是当前共享 lighting SH/occlusion 标量表达不足，下一步再考虑分区 lighting SH 或低秩 transfer residual。
+- 若 Step 10 和 Step 9 几乎一致，则优先保留更简单的 Step 9 参数，但把 PRT 作为 ablation，而不是主线强创新。
+
+跑完后回传：
+
+```text
+summary.txt
+training_regression_summary.txt
+training_regression_drop.svg
+best_iteration_eval_summary_val.txt
+best_iteration_eval_summary_val.json
+```
+
+若只需要重新汇总或服务器中断后续评估：
+
+```bash
+bash collect_step_10_prt_late.sh
+```
+
+### 2.19 Step 10 PRT late-gated safety 实验回传结论
+
+用户已完成 `train_step_10_prt_late.sh`，输出目录为：
+
+```bash
+/data2/zmh/output_physnorm_steps/step10_prt_late_30000_pcc065_tau010_nu15_mingate015_valhold8
+```
+
+严格 validation top-1 结果如下：
+
+| 场景 | Step 10 strict | 相对 Step 9 | 相对 PCC | 相对 Ref | 选择迭代 | 曲线 drop | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `bell` | 29.1857 | -3.2747 | -2.8244 | +4.1057 | 26k | 2.4342 | 关键失败；晚启用/弱 PRT 破坏了 Step 9 中最强收益 |
+| `teapot` | 26.3204 | +0.0202 | +1.0098 | +0.9204 | 30k | 0.0000 | 保持 Step 9 收益 |
+| `chair` | 33.7950 | +0.5432 | -0.0014 | -0.3150 | 26k | 0.1346 | 成功恢复到 PCC 水平 |
+| `materials` | 30.0372 | -0.0627 | -0.6386 | -0.4928 | 30k | 0.0000 | 未恢复，仍明显低于 PCC/Ref |
+| `ship` | 30.0662 | +0.0581 | +0.0752 | -0.0538 | 24k | 0.3383 | 小幅优于 Step 9/PCC，但仍低于 Ref |
+| `sedan` | 24.6330 | +0.1208 | -0.2632 | -1.5970 | 10k | 0.1737 | 比 Step 9 strict 稍好，但仍低于 PCC/Ref |
+| `toycar` | 24.6012 | -0.0248 | -0.0146 | -0.1288 | 10k | 0.2482 | 基本不变 |
+| `toaster` | 27.5356 | +0.4539 | +0.3484 | +1.6456 | 28k | 0.0274 | 明确优于 Step 9/PCC，反射控制通过 |
+
+平均结果：
+
+- Step 10 strict 平均为 `28.2718 dB`，低于 Step 9 strict 的 `28.5425 dB`，也低于固定 PCC strict 的 `28.5604 dB`。
+- 如果去掉 `bell`，Step 10 strict 平均为 `28.1412 dB`，比 Step 9 的 `27.9829 dB` 高 `0.1584 dB`。这说明 late-gated 策略并非全盘失败，负收益高度集中在 `bell`。
+- Step 10 final 平均为 `28.4477 dB`，低于 Step 9 final 的 `28.8515 dB`；去掉 `bell` 后二者几乎持平，Step 10 为 `28.3244 dB`，Step 9 为 `28.3359 dB`。
+- Step 10 strict FPS 平均为 `64.28`，final FPS 平均为 `65.69`，低于 Step 9 的 strict `87.34` 和 final `73.47`。本轮不支持“Step10 更快”的判断。
+
+开倒车诊断：
+
+- Step 10 只有 `bell` 被标记为明显开倒车：峰值在 `26000`，曲线 final 在 `30000`，drop 为 `2.4342 dB`，最坏单步为 `26000->27000(-1.42)`。
+- `materials` 在 Step 9 中出现 `9000->10000(-2.96)` 的 step-wise drop，Step 10 不再被标记，说明晚启用确实缓解了早期阶段扰动。
+- 但 `bell` 的失败说明对高反射场景而言，PRT 分支过晚、过弱地接入可能无法提供 Step 9 中的稳定化作用，甚至会在后期形成新的扰动。
+
+阶段结论：
+
+- Step 10 不能替代 Step 9 成为默认 PRT 设置，因为 `bell` 是关键反射控制场景，且失败幅度过大。
+- Step 10 的有效信号也很清楚：`chair/sedan/toaster/ship` 相比 Step 9 strict 有改善，尤其 `chair` 恢复到 PCC 水平，`toaster` 超过 PCC。
+- 因此“晚启用 + 更强 roughness gate”是有价值的方向，但不能对所有材质统一使用。后续若继续推进 PRT，应考虑材质分组调度：反射控制场景接近 Step 9 的中早期弱 PRT，弱反射/漫反射场景使用 Step 10 的 late-gated PRT。
+- `materials` 仍然低于 PCC/Ref，说明它的问题不只是启用时机，可能需要更强的 appearance/曝光/颜色基底保护，或更严格的 transfer 容量约束。
+
+当前决策：
+
+- 暂不新增下一轮实验脚本，先暂停推进并讨论。
+- Step 9 保留为 PRT 首版主参考；Step 10 保留为 late-gated ablation 和分组调度依据。
+- 讨论重点应放在：是否做材质自适应 PRT 调度、是否回到 Step 9 参数并只修 `materials/chair/sedan`、以及 PRT 是否应继续作为主创新还是降级为辅助消融。
+
+### 2.20 Ref-Gaussian 管线复盘与方向纠偏
+
+基于前面多轮实验、当前可视化结果和 Ref-Gaussian 论文方法复盘，当前需要暂停“继续外加 GI/PRT 模块”的实验节奏。核心原因如下：
+
+1. **GIP/PRT 当前不是 Ref-Gaussian 原生信息流。** 当前实现是在 Ref-Gaussian 的 PBR diffuse 项之后追加一个有界乘性残差：
+
+   ```text
+   diffuse <- diffuse * (1 + tau * responsibility * tanh(aux_map))
+   ```
+
+   它没有参与 Ref-Gaussian 的材质 alpha blending、split-sum 环境光查询、mesh visibility、inter-reflection ray tracing 或 material-aware normal propagation。因此它更像弱后处理残差，而不是对原管线缺陷的内生修正。
+
+2. **`probe_responsibility` 与 `prt_responsibility` 相似是代码设计导致的。** 当前两者都由同类材质门控得到：
+
+   ```text
+   q_diff = (1 - reflectance)^mu * roughness^nu
+   ```
+
+   若 `mu/nu` 接近，二者自然几乎一样。它们相似不能证明 probe 或 PRT 学到了真实 GI，只说明两者依赖同一组粗糙度/反射率属性。
+
+3. **全灰 `prt_map/probe_map` 表明该分支几乎没有有效信号。** 可视化使用 `tanh(map) * 0.5 + 0.5`，当 raw map 接近 0 时会显示为 0.5 灰。真实场景中这通常说明低频分支被强正则、弱梯度或低可观测性压回零附近；也可能说明它对最终渲染贡献很小。
+
+4. **真实场景瓶颈不主要是低频 GI。** Ref-Real 这类真实开放场景同时存在位姿误差、曝光/白平衡变化、模糊、动态遮挡、树叶/草地高频细节、背景污染、mesh 提取不可靠和全局 envmap 假设过强。单纯增加 diffuse GI/PRT 不能解决这些真实成像问题。
+
+5. **Ref-Gaussian 自身最值得改的是“可靠性分配”。** 它已经有远场 envmap、近场 inter-reflection、2DGS geometry 和 material-aware normal propagation。我们真正应改的是：哪些像素/高斯/视角可以监督这些物理分支，哪些应该被降权、校准或回退，而不是继续增加一个并不耦合的光照分支。
+
+据此，当前实验结论修正为：
+
+- **PCC 是保留模块。** 它直接解决 Ref-Gaussian 阶段切换和材质重置开倒车，是目前最稳定的有效改进。
+- **R2SF 是保留方向。** 它与 Ref-Gaussian envmap 的可观测性问题直接相关，但应继续保持 forward-preserving gradient gate，不应压暗前向镜面。
+- **GIP/PRT 暂降级为 ablation。** 它们证明低频 diffuse 修正有局部信号，但当前融合方式不够原生，不能作为主创新。
+- **下一阶段优先转向 Ref-Gaussian-native real-scene reliability/calibration。** 目标不是“再加一个光照模型”，而是让真实场景中不可靠的相机、颜色、几何和 ray tracing 不再污染材质、envmap 与 inter-reflection。
+
+候选主线命名暂定为 **Observation-Calibrated Reflective Gaussian Splatting, OC-RGS**。它不是替换 Ref-Gaussian 渲染方程，而是在其训练和物理分支监督中加入三个原生可靠性层：
+
+1. **View Photometric Calibration。** 每个训练视角学习受正则约束的 gain/bias 或低维 appearance code，用于吸收曝光、白平衡、局部光照变化，避免这些误差写入 albedo/envmap。
+2. **Robust Residual Weighting。** 用 photometric residual、alpha、normal/depth consistency 和可选特征一致性构造像素级可靠性权重，降低动态遮挡、模糊、树叶/草地细节和错误背景对 PBR 分支的梯度污染。
+3. **Ray/Geometry Confidence。** 对 inter-reflection 的 mesh hit、visibility、indirect radiance 加置信度门控。TSDF/mesh 或法向不可靠时，不让 ray-traced indirect 强行更新材质和环境光。
+
+暂停决策：
+
+- 不继续跑新的 PRT/GIP sweep。
+- 不把 `prt_map/probe_map` 全灰视作小 bug，而视作当前创新融合不足的证据。
+- 下一步先讨论是否将主线从 MGIP/PRT 改为 OC-RGS。如果认可，再实现最小版：只做 view photometric calibration + robust residual weighting，不碰渲染方程主体。
+
+### 2.21 Step 11 固定 PCC 全场景强基准
+
+当前决定：**PCC 不再做自适应版本，先冻结为固定 keep-ratio 的稳定辅助模块。** 这样做的目的是避免继续在 APCC/PCC 参数上消耗实验时间，而是建立一个足够强、足够稳定、可复用的内部基准。后续任何新创新模块都必须叠加在该固定 PCC 基准之上，并证明自己能继续带来增量收益。
+
+脚本：
+
+```bash
+bash train_step_11_pcc_full.sh
+```
+
+默认设置：
+
+- `PCC_KEEP=0.65`。
+- 关闭 `NCIF / R2IF / CGI / Probe / PRT / OAF`，只保留固定 PCC。
+- 非真实场景默认训练到 `50000`，从 `18000` 开始每 `1000` 轮保存与记录曲线；Ref-Real 按官方设置训练到 `20000`，从 `8000` 开始每 `1000` 轮保存与记录曲线。
+- 默认不划 validation holdout，使用官方训练集设置，生成内部 oracle 最优点：
+
+  ```bash
+  best_iteration_eval_summary_pcc_oracle.txt
+  best_iteration_eval_summary_pcc_oracle.json
+  ```
+
+  其中 best-iteration 选择使用 `test_fast,test`，同一迭代若同时存在 fast 与完整 test 记录，则优先采用完整 test 曲线。
+
+若需要 30k 快速版，可运行：
+
+```bash
+SYNTH_ITERS=30000 bash train_step_11_pcc_full.sh
+```
+
+若服务器存储压力过大，可把非真实场景保存间隔临时放宽：
+
+```bash
+SYNTH_SAVE_STEP=2000 bash train_step_11_pcc_full.sh
+```
+
+若训练已完成但服务器在汇总或 best-iteration eval 阶段中断，可直接继续：
+
+```bash
+RUN_TRAIN=0 bash train_step_11_pcc_full.sh
+```
+
+本轮回传重点：
+
+1. `summary.txt`
+2. `training_regression_summary.txt`
+3. `training_regression_drop.svg`
+4. `best_iteration_eval_summary_pcc_oracle.txt`
+5. `best_iteration_eval_summary_pcc_oracle.json`
+
+Step 11 完成后，将每个场景的最佳 PCC checkpoint 作为后续创新实验的默认比较对象。Ref-Gaussian 30k 仍保留为外部最低下限，但不再反复回头重测。
+
+#### Step 11A 回传结果：30k 固定 PCC oracle 基准
+
+回传时间：2026-06-04。
+
+本轮实际运行设置：
+
+```bash
+SYNTH_ITERS=30000 PCC_KEEP=0.65 bash train_step_11_pcc_full.sh
+```
+
+输出目录：
+
+```bash
+/data2/zmh/output_physnorm_steps/step11_pcc_full_30000_pcc065
+```
+
+需要区分两个口径：
+
+1. `summary.txt` 记录的是最终 `30k` / `20k` checkpoint 的常规评估结果。
+2. `best_iteration_eval_summary_pcc_oracle.txt` 记录的是从保存点中离线选出的每个场景最佳 checkpoint，是后续创新模块要对比的内部强基准。
+
+整体结果：
+
+| 口径 | 平均 PSNR | 平均 SSIM | 平均 LPIPS | 平均 FPS | 说明 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| final checkpoint | 31.1390 | 0.9310 | 0.0741 | 72.94 | `summary.txt`，非真实场景 30k，Ref-Real 20k |
+| PCC oracle best | 31.4393 | 0.9326 | 0.0739 | 51.29 | `best_iteration_eval_summary_pcc_oracle`，按保存点离线选最优 |
+
+PCC oracle 逐场景结果：
+
+| Dataset | Scene | Best Iter | PSNR | SSIM | LPIPS | Curve Drop |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| GlossySynthetic | angel | 30000 | 30.5894 | 0.9547 | 0.0426 | 0.0000 |
+| GlossySynthetic | bell | 22000 | 32.3173 | 0.9670 | 0.0454 | 3.8330 |
+| GlossySynthetic | cat | 30000 | 32.9795 | 0.9752 | 0.0372 | 0.0000 |
+| GlossySynthetic | horse | 30000 | 26.6831 | 0.9434 | 0.0482 | 0.0000 |
+| GlossySynthetic | luyu | 30000 | 29.5062 | 0.9482 | 0.0465 | 0.0000 |
+| GlossySynthetic | potion | 30000 | 32.6345 | 0.9621 | 0.0682 | 0.0000 |
+| GlossySynthetic | tbell | 30000 | 29.7966 | 0.9631 | 0.0573 | 0.0000 |
+| GlossySynthetic | teapot | 30000 | 26.4095 | 0.9469 | 0.0562 | 0.0000 |
+| NerfSynthetic | chair | 28000 | 34.1493 | 0.9792 | 0.0227 | 0.7877 |
+| NerfSynthetic | drums | 30000 | 26.4362 | 0.9530 | 0.0438 | 0.0000 |
+| NerfSynthetic | ficus | 30000 | 35.4976 | 0.9879 | 0.0127 | 0.0075 |
+| NerfSynthetic | hotdog | 30000 | 37.1992 | 0.9818 | 0.0294 | 0.0000 |
+| NerfSynthetic | lego | 24000 | 32.7650 | 0.9710 | 0.0326 | 0.1400 |
+| NerfSynthetic | materials | 30000 | 30.7101 | 0.9661 | 0.0368 | 0.0000 |
+| NerfSynthetic | mic | 29000 | 34.8044 | 0.9904 | 0.0079 | 0.0000 |
+| NerfSynthetic | ship | 30000 | 30.0519 | 0.8925 | 0.1337 | 0.0208 |
+| RefReal | gardenspheres | 14000 | 23.2852 | 0.6282 | 0.2887 | 0.1883 |
+| RefReal | sedan | 20000 | 26.2596 | 0.7668 | 0.2571 | 0.0184 |
+| RefReal | toycar | 16000 | 24.9320 | 0.6873 | 0.2594 | 0.2483 |
+| ShinyBlender | ball | 23000 | 36.6711 | 0.9868 | 0.0856 | 0.0070 |
+| ShinyBlender | car | 30000 | 30.9490 | 0.9656 | 0.0328 | 0.0000 |
+| ShinyBlender | coffee | 30000 | 34.7392 | 0.9766 | 0.0787 | 0.0000 |
+| ShinyBlender | helmet | 30000 | 31.9759 | 0.9715 | 0.0496 | 0.0000 |
+| ShinyBlender | teapot | 30000 | 46.7134 | 0.9974 | 0.0070 | 0.0000 |
+| ShinyBlender | toaster | 30000 | 27.9279 | 0.9515 | 0.0679 | 0.0000 |
+
+开倒车记录：
+
+| Dataset | Scene | Peak Iter | Peak Curve PSNR | Final Iter | Final Curve PSNR | Drop | Worst Step |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| GlossySynthetic | bell | 26000 | 32.5718 | 30000 | 28.7388 | 3.8330 | 28000 -> 29000 (-1.94) |
+| NerfSynthetic | hotdog | 30000 | 37.2844 | 30000 | 37.2844 | 0.0000 | 6000 -> 7000 (-1.21) |
+
+阶段记录：
+
+- 30k 固定 PCC 已经可以作为当前内部强基准。
+- `bell` 仍然是最典型的后期退化场景。即使使用固定 PCC，曲线峰值在 `26000`，但离线 oracle 最优 checkpoint 是 `22000`，说明训练曲线峰值和离线最终评估之间仍存在一定不一致。
+- `chair / lego / mic / gardenspheres / toycar / ball` 的最佳点不在最终轮次，后续创新模块比较时应优先使用每场景最佳 checkpoint，而不是统一 final checkpoint。
+- `hotdog` 被开倒车脚本标记为 early step-wise drop，但最终无下降，因此不属于主要风险场景。
+
+### 2.22 Step 12：GRT-GS 关键场景参数搜索
+
+当前论文主线已经收敛为 **GRT-GS = DDGI Probe Radiance + TSDF/BVH-initialized Gaussian PRT Transfer + PCC**。旧的 OAF/R2SF/APCC/NCIF/GIP-0/GIP-1 不再作为论文主贡献，只保留为历史探索或必要代码兼容。
+
+Step 12 目标：在固定 PCC 30k oracle 基准之上，使用完整 GRT 链路搜索最稳参数。完整链路包含 DDGI-style probe radiance、Gaussian PRT transfer、TSDF/BVH visibility 初始化和 PCC。
+
+脚本：
+
+```bash
+bash train_step_12_grt.sh
+```
+
+默认设置：
+
+- `PCC_KEEP=0.65`。
+- 关闭 `NCIF / R2IF / CGI / OAF / old probe diffuse / old PRT diffuse`。
+- 开启 `--use_grt`。
+- 开启 `--use_grt_visibility_init`，在 TSDF mesh/BVH 首次可用时用半球可见性拟合 Gaussian transfer 初值。
+- 非真实场景训练 `30000`，Ref-Real 训练 `20000`。
+- GRT 默认：`GRT_MODE=dot`, `GRT_TAU=0.5`, `PROBE_RES=8`, `GRT_VIS_RAYS=64`。
+- `GRT_TRANSFER_REFRESH=0` 表示只初始化一次；若要测试周期性更新，可设为 `2000`。
+- 输出 `grt_map / grt_probe / grt_visibility` 三类可解释图。
+
+建议第一轮参数搜索：
+
+```bash
+bash train_step_12_grt.sh
+GRT_MODE=hybrid GRT_TAU=0.5 bash train_step_12_grt.sh
+GRT_MODE=directional GRT_TAU=0.5 bash train_step_12_grt.sh
+GRT_MODE=dot GRT_TAU=0.25 bash train_step_12_grt.sh
+PROBE_RES=4 GRT_MODE=dot GRT_TAU=0.5 bash train_step_12_grt.sh
+GRT_VIS_RAYS=96 GRT_MODE=dot GRT_TAU=0.5 bash train_step_12_grt.sh
+GRT_TRANSFER_REFRESH=2000 GRT_MODE=dot GRT_TAU=0.5 STEP_NAME=step12_grtfull_refresh bash train_step_12_grt.sh
+```
+
+每个配置默认跑 9 个关键场景：
+
+| 类型 | 场景 |
+| --- | --- |
+| 反射控制 | `GlossySynthetic/bell`, `GlossySynthetic/teapot`, `ShinyBlender/toaster` |
+| 弱反射/漫反射 | `NerfSynthetic/chair`, `NerfSynthetic/materials`, `NerfSynthetic/ship` |
+| 真实场景 | `RefReal/gardenspheres`, `RefReal/sedan`, `RefReal/toycar` |
+
+跑完每个配置后回传：
+
+1. `summary.txt`
+2. `training_regression_summary.txt`
+3. `training_regression_drop.svg`
+4. `best_iteration_eval_summary_grt_oracle.txt`
+5. `best_iteration_eval_summary_grt_oracle.json`
+
+若某个场景异常，再补：
+
+1. `test/renders/grt/`
+2. `test/renders/grt_probe/`
+3. `test/renders/grt_visibility/`
+4. `env1.png / env2.png`
+
+判断标准：
+
+- 首先与 Step 11A fixed PCC oracle 对比，而不是只和 Ref-Gaussian 30k 对比。
+- `bell/toaster` 不能显著低于 PCC，否则说明 GRT 破坏反射主链路。
+- `chair/materials/ship` 若小幅下降但 Ref-Real 明显提升，需要继续讨论；若二者都下降，则该参数组合淘汰。
+- `grt_map` 不能全灰，`grt_visibility` 应具有几何/反射相关结构，否则说明 GRT 没有真正学到 transfer。
+- 若 `PROBE_RES=4` 指标接近 `8`，优先选择 `4` 以降低训练开销。
+
+### 2.23 Step 13：GRT-GS 全场景评估
+
+Step 13 用于把 Step 12 选出的完整 GRT 参数跑到全数据集。它不是新的方法，只是全量评估脚本。
+
+脚本：
+
+```bash
+bash train_step_13_grt_full.sh
+```
+
+默认设置与 Step 12 一致，但覆盖全部当前实验场景：
+
+- Shiny Blender：`ball / car / coffee / helmet / teapot / toaster`
+- Glossy Synthetic：`angel / bell / cat / horse / luyu / potion / tbell / teapot`
+- NeRF Synthetic：`chair / drums / ficus / hotdog / lego / materials / mic / ship`
+- Ref-Real：`gardenspheres / toycar / sedan`
+
+若 Step 12 已确定参数，Step 13 应显式带上同一组环境变量，例如：
+
+```bash
+GRT_MODE=dot GRT_TAU=0.5 PROBE_RES=8 GRT_VIS_RAYS=64 bash train_step_13_grt_full.sh
+```
+
+全量结果需要同时回传：
+
+1. `summary.txt`
+2. `training_regression_summary.txt`
+3. `training_regression_drop.svg`
+4. `best_iteration_eval_summary_grt_oracle.txt`
+5. `best_iteration_eval_summary_grt_oracle.json`
+
 ---
 
 ## 3. 工程实现路线图
@@ -678,11 +1099,10 @@ bash train_step_7_apcc_highkeep.sh
 | --- | --- | --- |
 | `train.sh` | 保留 | 原始/批量训练命令集合，便于和早期实验对照 |
 | `train_step_0.sh` | 保留 | Ref-Gaussian baseline 全场景诊断 |
-| `train_step_8_pcc_val.sh` | 保留 | 固定 `PCC=0.65` 强基准，validation top-1 选点 |
-| `train_step_5.sh` | 保留为 ablation | GIP-1 grid probe 复现实验；当前结论是不进入默认主线 |
-| `train_step_9_prt.sh` | 新增 | PRT-GS / Gaussian Radiance Transfer 首轮关键场景实验 |
+| `train_step_11_pcc_full.sh` | 已完成/当前基准 | 固定 PCC 全场景强基准，记录每个场景最佳 checkpoint |
+| `train_step_12_grt.sh` | 当前要跑 | GRT-GS 关键场景参数搜索：DDGI probe + Gaussian PRT transfer + PCC |
 
-已删除的脚本包括 `train_step_1/2/2_fix/3/4/4_fix/4_safety/6/7/7_highkeep.sh` 与 `eval_step_8_pcc_val_strict.sh`。这些脚本对应的实验结论已经记录在第 2 节；后续不再从文件入口运行它们。
+已删除的脚本包括 `train_step_1/2/2_fix/3/4/4_fix/4_safety/5/6/7/7_highkeep/8/9/10.sh`、`collect_step_9/10*.sh` 与 `eval_step_8_pcc_val_strict.sh`。这些脚本对应的实验结论已经记录在第 2 节；后续不再从文件入口运行它们。
 
 下面 4.1-4.10 保留为历史说明，用于追踪旧实验设计，不代表当前需要运行。
 
@@ -947,27 +1367,24 @@ bash train_step_8_pcc_val.sh
 
 ## 5. 接下来执行顺序
 
-当前不要继续重跑 GIP-1 grid probe，也不要继续扫 PCC/APCC/OAF/NCIF。下一轮主线改为：
+当前执行顺序已经更新为 GRT-GS 主线：
 
-1. **实现 PRT-GS / Gaussian Radiance Transfer 首版。** 使用共享低频 lighting SH 和 Gaussian 解析/低秩 transfer，替代密集 grid probe。
-2. **保持固定 PCC=0.65 强基准。** 所有新模块都必须和 `train_step_8_pcc_val.sh` 的 strict 口径比较。
-3. **第一轮只跑小规模关键场景。** 建议 `chair / materials / ship / sedan / toycar / bell / toaster / teapot`，先判断方向，不跑全量。
-4. **效率必须作为硬指标。** 若训练时间接近 GIP-1 grid probe 的 `2 h` 级别，即使指标小涨也不进入主线。
-5. **若 PRT-GS 有信号，再做 visibility/分区扩展。** 若没有信号，回退到固定 PCC + appearance/exposure/anti-aliasing/geometry 稳定化路线。
+1. **固定内部强基准。** 使用 Step 11A 的 fixed PCC 30k oracle 作为后续所有创新模块的比较对象。
+2. **运行 Step 12 完整 GRT 参数搜索。** 关键 9 场景默认启用 TSDF/BVH transfer 初始化，先判断完整链路是否有效。
+3. **筛选默认 GRT 设置。** 优先选择平均指标高、`bell/toaster` 不崩、`grt_map/grt_visibility` 有结构且训练时间可接受的配置。
+4. **运行 Step 13 全场景 GRT。** 使用 Step 12 选出的参数跑全量数据集。
+5. **最后写论文实验表。** 表格以 Ref-Gaussian 30k、fixed PCC oracle、GRT-GS 三者为主。
 
-PRT-GS 首版已经落地后，运行：
-
-```bash
-bash train_step_9_prt.sh
-```
-
-默认输出：
+第一轮建议依次运行：
 
 ```bash
-/data2/zmh/output_physnorm_steps/step9_prt_gs_30000_pcc065_tau012_mingate015_valhold8
+bash train_step_12_grt.sh
+GRT_MODE=hybrid GRT_TAU=0.5 bash train_step_12_grt.sh
+GRT_MODE=directional GRT_TAU=0.5 bash train_step_12_grt.sh
+GRT_MODE=dot GRT_TAU=0.25 bash train_step_12_grt.sh
+PROBE_RES=4 GRT_MODE=dot GRT_TAU=0.5 bash train_step_12_grt.sh
+GRT_VIS_RAYS=96 GRT_MODE=dot GRT_TAU=0.5 bash train_step_12_grt.sh
 ```
-
-回传 `summary.txt`、`training_regression_summary.txt`、`training_regression_drop.svg`、`best_iteration_eval_summary_val.txt/json`。若某个场景异常，再补 `test/renders/prt/` 与 `test/renders/prt_responsibility/`。
 
 以下历史执行顺序仅用于解释此前实验脉络。
 

@@ -142,9 +142,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         # Set render
-        opt.enable_ncif = dataset.use_ncif and iteration >= opt.ncif_from_iter
-        opt.enable_probe_gi = getattr(opt, "use_probe_gi", False) and iteration >= getattr(opt, "probe_from_iter", 0)
-        opt.enable_prt_gs = getattr(opt, "use_prt_gs", False) and iteration >= getattr(opt, "prt_from_iter", 0)
+        opt.enable_ncif = False
+        opt.enable_probe_gi = False
+        opt.enable_prt_gs = False
+        opt.enable_grt = getattr(opt, "use_grt", False) and iteration >= getattr(opt, "grt_from_iter", 0)
         opt.current_iteration = iteration
         render = select_render_method(iteration, opt, initial_stage)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, srgb=opt.srgb, opt=opt)
@@ -169,6 +170,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         with torch.no_grad():
+            grt_initialized_this_iter = False
             
             if iteration % TEST_INTERVAL == 0 or iteration == first_iter + 1 or iteration == opt.volume_render_until_iter + 1:
                 save_training_vis(viewpoint_cam, gaussians, background, render, pipe, opt, iteration, initial_stage)
@@ -264,6 +266,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     ply_path = os.path.join(model_path,f'test_{iteration:06d}.ply')
                     o3d.io.write_triangle_mesh(ply_path, mesh)
                     gaussians.update_mesh(mesh)
+                    grt_init = gaussians.initialize_grt_transfer_from_bvh(opt, iteration=iteration)
+                    if grt_init is not None:
+                        grt_initialized_this_iter = True
+                        print(
+                            "[GRT-BVH init] "
+                            f"iter={grt_init['iteration']} "
+                            f"gaussians={grt_init['gaussians']} "
+                            f"rays={grt_init['rays']} "
+                            f"coeffs={grt_init['coeffs']} "
+                            f"mean_visibility={grt_init['mean_visibility']:.4f}"
+                        )
+                    if grt_initialized_this_iter and iteration in saving_iterations and iteration >= opt.densify_until_iter:
+                        print(f"\n[ITER {iteration}] Re-saving Gaussians after GRT-BVH init")
+                        scene.save(iteration)
 
             if iteration < TOT_ITER:
                 gaussians.optimizer.step()
@@ -385,18 +401,14 @@ def save_training_vis(viewpoint_cam, gaussians, background, render_fn, pipe, opt
                     render_pkg["direct_light"],
                     render_pkg["indirect_light"],
                 ]
-            if "oaf_blend" in render_pkg:
-                visualization_list.append(render_pkg["oaf_blend"].repeat(3, 1, 1))
             if "specular_reliability" in render_pkg:
                 visualization_list.append(render_pkg["specular_reliability"].repeat(3, 1, 1))
-            if "probe_map" in render_pkg:
-                visualization_list.append(torch.tanh(render_pkg["probe_map"]) * 0.5 + 0.5)
-            if "probe_responsibility" in render_pkg:
-                visualization_list.append(render_pkg["probe_responsibility"].repeat(3, 1, 1))
-            if "prt_map" in render_pkg:
-                visualization_list.append(torch.tanh(render_pkg["prt_map"]) * 0.5 + 0.5)
-            if "prt_responsibility" in render_pkg:
-                visualization_list.append(render_pkg["prt_responsibility"].repeat(3, 1, 1))
+            if "grt_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["grt_map"]) * 0.5 + 0.5)
+            if "grt_probe_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["grt_probe_map"]) * 0.5 + 0.5)
+            if "grt_visibility" in render_pkg:
+                visualization_list.append(render_pkg["grt_visibility"].repeat(3, 1, 1))
 
         else:
             visualization_list = [
@@ -413,18 +425,14 @@ def save_training_vis(viewpoint_cam, gaussians, background, render_fn, pipe, opt
                 render_pkg["surf_normal"] * 0.5 + 0.5,  
                 error_map, 
             ]
-            if "oaf_blend" in render_pkg:
-                visualization_list.append(render_pkg["oaf_blend"].repeat(3, 1, 1))
             if "specular_reliability" in render_pkg:
                 visualization_list.append(render_pkg["specular_reliability"].repeat(3, 1, 1))
-            if "probe_map" in render_pkg:
-                visualization_list.append(torch.tanh(render_pkg["probe_map"]) * 0.5 + 0.5)
-            if "probe_responsibility" in render_pkg:
-                visualization_list.append(render_pkg["probe_responsibility"].repeat(3, 1, 1))
-            if "prt_map" in render_pkg:
-                visualization_list.append(torch.tanh(render_pkg["prt_map"]) * 0.5 + 0.5)
-            if "prt_responsibility" in render_pkg:
-                visualization_list.append(render_pkg["prt_responsibility"].repeat(3, 1, 1))
+            if "grt_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["grt_map"]) * 0.5 + 0.5)
+            if "grt_probe_map" in render_pkg:
+                visualization_list.append(torch.tanh(render_pkg["grt_probe_map"]) * 0.5 + 0.5)
+            if "grt_visibility" in render_pkg:
+                visualization_list.append(render_pkg["grt_visibility"].repeat(3, 1, 1))
   
 
         grid = torch.stack(visualization_list, dim=0)

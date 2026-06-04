@@ -221,21 +221,36 @@ def write_drop_chart(output_dir, regression_rows):
     left = 330
     right = 36
     height = max(150, top + len(rows) * row_h + 42)
-    max_drop = max([row["analysis"]["final_drop"] for row in rows] or [1.0])
+    max_drop = max([row["analysis"]["final_drop"] for row in rows] or [0.0])
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="20" y="28" font-family="Arial" font-size="16" fill="#111827">Training Regression Drop</text>',
     ]
+    if not rows:
+        svg.append(f'<text x="20" y="{top + 16}" font-family="Arial" font-size="13" fill="#374151">No regression scene above threshold.</text>')
+        svg.append("</svg>")
+        Path(output_dir, "training_regression_drop.svg").write_text("\n".join(svg), encoding="utf-8")
+        return
+
+    if max_drop <= 1e-8:
+        svg.append(
+            f'<text x="20" y="{top + 16}" font-family="Arial" font-size="13" fill="#374151">'
+            'Flagged by step-wise drops, but final drops are zero. See training_regression_summary.txt for WorstStep.'
+            '</text>'
+        )
+
     for idx, row in enumerate(rows):
         y = top + idx * row_h
         drop = row["analysis"]["final_drop"]
-        bar_w = (width - left - right) * drop / max_drop
+        bar_w = 0.0 if max_drop <= 1e-8 else (width - left - right) * drop / max_drop
         label = f'{row["dataset"]}/{row["scene"]}'
         svg.append(f'<text x="{left - 8}" y="{y + 14}" text-anchor="end" font-family="Arial" font-size="11" fill="#374151">{html.escape(label[-64:])}</text>')
-        svg.append(f'<rect x="{left}" y="{y}" width="{bar_w:.2f}" height="17" fill="#dc2626" opacity="0.78"/>')
-        svg.append(f'<text x="{left + bar_w + 6:.2f}" y="{y + 13}" font-family="Arial" font-size="11" fill="#111827">{drop:.3f}</text>')
+        if bar_w > 0.0:
+            svg.append(f'<rect x="{left}" y="{y}" width="{bar_w:.2f}" height="17" fill="#dc2626" opacity="0.78"/>')
+        worst = row["analysis"].get("worst_step_drop", 0.0)
+        svg.append(f'<text x="{left + max(bar_w, 2.0) + 6:.2f}" y="{y + 13}" font-family="Arial" font-size="11" fill="#111827">final {drop:.3f} | worst {worst:.3f}</text>')
     svg.append("</svg>")
     Path(output_dir, "training_regression_drop.svg").write_text("\n".join(svg), encoding="utf-8")
 

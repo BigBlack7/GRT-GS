@@ -78,7 +78,7 @@ class GaussianModel:
         self.asg_param = init_predefined_omega(4, 8)
 
 
-    def __init__(self, sh_degree : int, use_ncif: bool = True):
+    def __init__(self, sh_degree : int, use_ncif: bool = False):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self.use_ncif = use_ncif
@@ -111,6 +111,8 @@ class GaussianModel:
         self._prt_lighting = torch.empty(0)
         self._prt_occlusion = torch.empty(0)
         self.prt_sh_degree = 0
+        self._grt_transfer = torch.empty(0)
+        self.grt_sh_degree = 0
 
         self.optimizer = None
         self.free_radius = 0    
@@ -130,11 +132,13 @@ class GaussianModel:
         self.env_directions1 = get_env_direction1(self.env_H, self.env_W)
         self.env_directions2 = get_env_direction2(self.env_H, self.env_W)
         self.ray_tracer = None
+        self.grt_transfer_bvh_initialized = False
+        self.grt_transfer_bvh_iteration = -1
         self.setup_functions()
 
     def capture(self):
         return (
-            "physnorm_prt_v1",
+            "physnorm_grt_v2",
             self.active_sh_degree,
             self._xyz,
             self._refl_strength, 
@@ -166,10 +170,14 @@ class GaussianModel:
             self._prt_lighting,
             self._prt_occlusion,
             self.prt_sh_degree,
+            self._grt_transfer,
+            self.grt_sh_degree,
+            self.grt_transfer_bvh_initialized,
+            self.grt_transfer_bvh_iteration,
         )
     
     def restore(self, model_args, training_args):
-        if len(model_args) > 0 and model_args[0] == "physnorm_prt_v1":
+        if len(model_args) > 0 and model_args[0] in {"physnorm_grt_v1", "physnorm_grt_v2", "physnorm_prt_v1"}:
             (_version,
             self.active_sh_degree,
             self._xyz,
@@ -201,7 +209,18 @@ class GaussianModel:
             self.probe_sh_degree,
             self._prt_lighting,
             self._prt_occlusion,
-            self.prt_sh_degree) = model_args
+            self.prt_sh_degree,
+            *grt_state) = model_args
+            if len(grt_state) >= 2:
+                self._grt_transfer = grt_state[0]
+                self.grt_sh_degree = grt_state[1]
+                self.grt_transfer_bvh_initialized = bool(grt_state[2]) if len(grt_state) >= 3 else False
+                self.grt_transfer_bvh_iteration = int(grt_state[3]) if len(grt_state) >= 4 else -1
+            else:
+                self._grt_transfer = torch.empty((self._xyz.shape[0], 0), device=self._xyz.device)
+                self.grt_sh_degree = 0
+                self.grt_transfer_bvh_initialized = False
+                self.grt_transfer_bvh_iteration = -1
         elif len(model_args) > 0 and model_args[0] == "physnorm_probe_v1":
             (_version,
             self.active_sh_degree,
@@ -370,6 +389,11 @@ class GaussianModel:
             self._prt_lighting = nn.Parameter(self._prt_lighting.to("cuda").requires_grad_(True))
         if self._prt_occlusion.numel() > 0 and not isinstance(self._prt_occlusion, nn.Parameter):
             self._prt_occlusion = nn.Parameter(self._prt_occlusion.to("cuda").requires_grad_(True))
+        if self._grt_transfer.numel() == 0 and self._grt_transfer.dim() <= 1:
+            self._grt_transfer = torch.empty((self._xyz.shape[0], 0), device="cuda")
+            self.grt_sh_degree = 0
+        elif self._grt_transfer.numel() > 0 and not isinstance(self._grt_transfer, nn.Parameter):
+            self._grt_transfer = nn.Parameter(self._grt_transfer.to("cuda").requires_grad_(True))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -425,7 +449,7 @@ class GaussianModel:
         return (int(degree) + 1) ** 2
 
     def _init_probe_field(self, training_args):
-        if not getattr(training_args, "use_probe_gi", False):
+        if not (getattr(training_args, "use_probe_gi", False) or getattr(training_args, "use_grt", False)):
             return
         if self._probe_grid.numel() > 0:
             if not isinstance(self._probe_grid, nn.Parameter):
@@ -433,7 +457,8 @@ class GaussianModel:
             return
 
         res = max(2, int(getattr(training_args, "probe_grid_res", 8)))
-        degree = max(0, min(2, int(getattr(training_args, "probe_sh_degree", 2))))
+        degree_name = "grt_sh_degree" if getattr(training_args, "use_grt", False) else "probe_sh_degree"
+        degree = max(0, min(2, int(getattr(training_args, degree_name, 2))))
         coeffs = self._probe_num_coeffs(degree)
         with torch.no_grad():
             xyz = self.get_xyz.detach()
@@ -510,6 +535,191 @@ class GaussianModel:
         basis = self._probe_sh_basis(normals, degree)
         return (coeffs * basis[..., None]).sum(dim=1)
 
+    def _grt_num_coeffs(self, degree):
+        return (int(degree) + 1) ** 2
+
+    def _init_grt_transfer(self, training_args):
+        if not getattr(training_args, "use_grt", False):
+            return
+        if self._grt_transfer.numel() > 0:
+            if not isinstance(self._grt_transfer, nn.Parameter):
+                self._grt_transfer = nn.Parameter(self._grt_transfer.to("cuda").requires_grad_(True))
+            return
+
+        degree = max(0, min(2, int(getattr(training_args, "grt_sh_degree", 2))))
+        coeffs = self._grt_num_coeffs(degree)
+        transfer = torch.zeros((self.get_xyz.shape[0], coeffs), dtype=torch.float, device="cuda")
+        transfer[:, 0] = float(getattr(training_args, "grt_transfer_init", 1.0))
+        self._grt_transfer = nn.Parameter(transfer.requires_grad_(True))
+        self.grt_sh_degree = degree
+
+    def _grt_geometry_normals(self):
+        splat2world = self.get_covariance(1.0)
+        return safe_normalize(splat2world[:, 2, :3])
+
+    def _grt_local_hemisphere_directions(self, n_rays, device):
+        idx = torch.arange(n_rays, dtype=torch.float32, device=device)
+        z = (idx + 0.5) / float(n_rays)
+        r = torch.sqrt((1.0 - z * z).clamp_min(0.0))
+        phi = idx * (np.pi * (3.0 - np.sqrt(5.0)))
+        return torch.stack((r * torch.cos(phi), r * torch.sin(phi), z), dim=-1)
+
+    def _grt_world_hemisphere_directions(self, normals, local_dirs):
+        up_z = torch.zeros_like(normals)
+        up_z[:, 2] = 1.0
+        up_y = torch.zeros_like(normals)
+        up_y[:, 1] = 1.0
+        up = torch.where(normals[:, 2:3].abs() < 0.9, up_z, up_y)
+        tangent = safe_normalize(torch.cross(up, normals, dim=-1))
+        bitangent = safe_normalize(torch.cross(normals, tangent, dim=-1))
+        dirs = (
+            local_dirs[None, :, 0:1] * tangent[:, None, :]
+            + local_dirs[None, :, 1:2] * bitangent[:, None, :]
+            + local_dirs[None, :, 2:3] * normals[:, None, :]
+        )
+        return safe_normalize(dirs)
+
+    def _assign_grt_transfer(self, transfer):
+        transfer = transfer.to(self.get_xyz.device).float()
+        old_param = self._grt_transfer if isinstance(self._grt_transfer, nn.Parameter) else None
+        if isinstance(self._grt_transfer, nn.Parameter) and self._grt_transfer.shape == transfer.shape:
+            self._grt_transfer.data.copy_(transfer)
+        else:
+            self._grt_transfer = nn.Parameter(transfer.requires_grad_(True))
+            if self.optimizer is not None:
+                for group in self.optimizer.param_groups:
+                    if group.get("name") == "grt_transfer":
+                        group["params"] = [self._grt_transfer]
+                        break
+        if isinstance(self._grt_transfer, nn.Parameter) and self._grt_transfer.grad is not None:
+            self._grt_transfer.grad.zero_()
+        if old_param is not None and old_param is not self._grt_transfer and old_param.grad is not None:
+            old_param.grad = None
+
+    @torch.no_grad()
+    def initialize_grt_transfer_from_bvh(self, training_args, iteration=None):
+        if not getattr(training_args, "use_grt", False):
+            return None
+        if not getattr(training_args, "use_grt_visibility_init", True):
+            return None
+        if self.ray_tracer is None or self.get_xyz.numel() == 0:
+            return None
+
+        iteration = int(iteration) if iteration is not None else -1
+        grt_from = int(getattr(training_args, "grt_from_iter", 0))
+        if iteration >= 0 and iteration < grt_from:
+            return None
+
+        refresh_interval = int(getattr(training_args, "grt_transfer_refresh_interval", 0))
+        if self.grt_transfer_bvh_initialized:
+            if refresh_interval <= 0:
+                return None
+            if iteration >= 0 and (iteration - self.grt_transfer_bvh_iteration) < refresh_interval:
+                return None
+
+        if self._grt_transfer.numel() == 0 or not isinstance(self._grt_transfer, nn.Parameter):
+            self._init_grt_transfer(training_args)
+        if self._grt_transfer.numel() == 0:
+            return None
+
+        degree = max(0, min(2, int(getattr(training_args, "grt_sh_degree", self.grt_sh_degree))))
+        coeffs = self._grt_num_coeffs(degree)
+        n_rays = max(coeffs + 4, int(getattr(training_args, "grt_visibility_rays", 64)))
+        chunk = max(1, int(getattr(training_args, "grt_visibility_chunk", 4096)))
+        eps = max(1e-5, float(getattr(training_args, "grt_visibility_eps", 0.02)))
+        blend = min(1.0, max(0.0, float(getattr(training_args, "grt_transfer_blend", 1.0))))
+        clamp_value = float(getattr(training_args, "grt_transfer_clamp", 4.0))
+
+        xyz = self.get_xyz.detach()
+        normals = self._grt_geometry_normals().detach()
+        extent = (xyz.amax(dim=0) - xyz.amin(dim=0)).norm().item()
+        max_distance = float(getattr(training_args, "grt_visibility_max_distance", 0.0))
+        if max_distance <= 0.0:
+            max_distance = max(extent * 1.5, 1.0)
+
+        local_dirs = self._grt_local_hemisphere_directions(n_rays, xyz.device)
+        fitted = torch.empty((xyz.shape[0], coeffs), dtype=torch.float32, device=xyz.device)
+        visibility_means = []
+
+        for start in range(0, xyz.shape[0], chunk):
+            end = min(start + chunk, xyz.shape[0])
+            chunk_xyz = xyz[start:end]
+            chunk_normals = normals[start:end]
+            dirs = self._grt_world_hemisphere_directions(chunk_normals, local_dirs)
+            origins = (chunk_xyz[:, None, :] + chunk_normals[:, None, :] * eps).expand_as(dirs).contiguous()
+
+            _, _, depth = self.ray_tracer.trace(
+                origins.reshape(-1, 3),
+                dirs.reshape(-1, 3),
+            )
+            depth = depth.reshape(end - start, n_rays)
+            hit = torch.isfinite(depth) & (depth > eps) & (depth < max_distance)
+            visible = (~hit).float()
+            visibility_means.append(visible.mean())
+
+            basis = self._probe_sh_basis(dirs.reshape(-1, 3), degree).reshape(end - start, n_rays, coeffs)
+            rhs = visible.unsqueeze(-1)
+            try:
+                solution = torch.linalg.lstsq(basis, rhs).solution.squeeze(-1)
+            except RuntimeError:
+                solution = torch.matmul(torch.linalg.pinv(basis), rhs).squeeze(-1)
+            solution = torch.nan_to_num(solution, nan=0.0, posinf=0.0, neginf=0.0)
+            if clamp_value > 0.0:
+                solution = solution.clamp(-clamp_value, clamp_value)
+            fitted[start:end] = solution
+
+        current = self._grt_transfer.detach()
+        if current.shape[0] == fitted.shape[0] and current.shape[1] >= coeffs and blend < 1.0:
+            target = current[:, :coeffs] * (1.0 - blend) + fitted * blend
+        else:
+            target = fitted
+        if current.shape[0] == fitted.shape[0] and current.shape[1] > coeffs:
+            target = torch.cat([target, current[:, coeffs:]], dim=1)
+
+        self._assign_grt_transfer(target)
+        self.grt_sh_degree = degree
+        self.grt_transfer_bvh_initialized = True
+        self.grt_transfer_bvh_iteration = iteration
+
+        mean_visibility = torch.stack(visibility_means).mean().item() if visibility_means else 0.0
+        return {
+            "iteration": iteration,
+            "gaussians": int(xyz.shape[0]),
+            "rays": int(n_rays),
+            "coeffs": int(coeffs),
+            "mean_visibility": float(mean_visibility),
+        }
+
+    def has_grt_field(self):
+        return self.has_probe_field() and self._grt_transfer.numel() > 0
+
+    @property
+    def get_grt_transfer(self):
+        return self._grt_transfer
+
+    def get_grt_indirect(self, xyz, normals, reflection, opt=None):
+        if not self.has_grt_field():
+            return None, None, None, None
+        degree = min(int(self.grt_sh_degree), int(self.probe_sh_degree))
+        coeff_count = self._grt_num_coeffs(degree)
+        coeffs = self._trilinear_probe_coeffs(xyz)[:, :coeff_count]
+        transfer = self.get_grt_transfer[:, :coeff_count]
+        probe_dot = (coeffs * transfer[..., None]).sum(dim=1)
+
+        refl_basis = self._probe_sh_basis(reflection, degree)
+        probe_dir = (coeffs * refl_basis[..., None]).sum(dim=1)
+        transfer_vis = torch.sigmoid((transfer * refl_basis).sum(dim=1, keepdim=True))
+        directional = probe_dir * transfer_vis
+
+        mode = str(getattr(opt, "grt_mode", "dot")).lower() if opt is not None else "dot"
+        if mode == "directional":
+            indirect = directional
+        elif mode == "hybrid":
+            indirect = 0.5 * probe_dot + 0.5 * directional
+        else:
+            indirect = probe_dot
+        return indirect.clamp_min(0.0), probe_dir.clamp_min(0.0), transfer_vis, probe_dot
+
     def probe_smoothness_loss(self):
         if not self.has_probe_field():
             return torch.zeros((), device="cuda")
@@ -524,10 +734,19 @@ class GaussianModel:
             return torch.zeros((), device="cuda")
         return self._probe_grid.pow(2).mean()
 
+    def grt_transfer_loss(self):
+        if self._grt_transfer.numel() == 0:
+            return torch.zeros((), device="cuda")
+        if self._grt_transfer.shape[1] <= 1:
+            return self._grt_transfer.pow(2).mean()
+        return self._grt_transfer[:, 1:].pow(2).mean()
+
     def _prt_num_coeffs(self, degree):
         return (int(degree) + 1) ** 2
 
     def _init_prt_field(self, training_args):
+        if not getattr(training_args, "use_prt_gs", False):
+            return
         if self._prt_occlusion.numel() == 0 and self.get_xyz.numel() > 0:
             init_occ = float(getattr(training_args, "prt_occlusion_init", 0.75))
             init_occ = max(1e-4, min(1.0 - 1e-4, init_occ))
@@ -536,8 +755,6 @@ class GaussianModel:
         elif self._prt_occlusion.numel() > 0 and not isinstance(self._prt_occlusion, nn.Parameter):
             self._prt_occlusion = nn.Parameter(self._prt_occlusion.to("cuda").requires_grad_(True))
 
-        if not getattr(training_args, "use_prt_gs", False):
-            return
         if self._prt_lighting.numel() > 0:
             if not isinstance(self._prt_lighting, nn.Parameter):
                 self._prt_lighting = nn.Parameter(self._prt_lighting.to("cuda").requires_grad_(True))
@@ -708,10 +925,9 @@ class GaussianModel:
         normals2 = np.copy(normals1)
         self._normal1 = nn.Parameter(torch.from_numpy(normals1).to(self._xyz.device).requires_grad_(True))
         self._normal2 = nn.Parameter(torch.from_numpy(normals2).to(self._xyz.device).requires_grad_(True))
-        ncif_dir = torch.zeros((self._xyz.shape[0], 3), device="cuda")
-        self._ncif_dir = nn.Parameter(ncif_dir.requires_grad_(True))
-        prt_occ = torch.ones((self._xyz.shape[0], 1), device="cuda") * 0.75
-        self._prt_occlusion = nn.Parameter(self.inverse_opacity_activation(prt_occ).requires_grad_(True))
+        self._ncif_dir = torch.empty((self._xyz.shape[0], 0), device="cuda")
+        self._prt_occlusion = torch.empty((self._xyz.shape[0], 0), device="cuda")
+        self._grt_transfer = torch.empty((self._xyz.shape[0], 0), device="cuda")
 
         self.env_map = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
         self.env_map_2 = EnvLight(path=None, device='cuda', max_res=args.envmap_max_res, min_roughness=args.envmap_min_roughness, max_roughness=args.envmap_max_roughness, trainable=True).cuda()
@@ -723,7 +939,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._init_probe_field(training_args)
-        self._init_prt_field(training_args)
+        self._init_grt_transfer(training_args)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -751,18 +967,12 @@ class GaussianModel:
             {'params': [self._indirect_rest], 'lr': training_args.indirect_lr / 20.0, "name": "ind_rest"},
             {'params': [self._indirect_asg], 'lr': training_args.asg_lr, "name": "ind_asg"},
         ])
-        if self._ncif_dir.numel() > 0:
-            ncif_lr = training_args.ncif_lr if self.use_ncif else 0.0
-            l.append({'params': [self._ncif_dir], 'lr': ncif_lr, "name": "ncif_dir"})
         if self.has_probe_field():
-            probe_lr = training_args.probe_lr if getattr(training_args, "use_probe_gi", False) else 0.0
+            probe_lr = training_args.probe_lr if (getattr(training_args, "use_probe_gi", False) or getattr(training_args, "use_grt", False)) else 0.0
             l.append({'params': [self._probe_grid], 'lr': probe_lr, "name": "probe_grid"})
-        if self._prt_lighting.numel() > 0:
-            prt_lr = training_args.prt_lr if getattr(training_args, "use_prt_gs", False) else 0.0
-            l.append({'params': [self._prt_lighting], 'lr': prt_lr, "name": "prt_lighting"})
-        if self._prt_occlusion.numel() > 0:
-            occ_lr = training_args.prt_occlusion_lr if getattr(training_args, "use_prt_gs", False) else 0.0
-            l.append({'params': [self._prt_occlusion], 'lr': occ_lr, "name": "prt_occlusion"})
+        if self._grt_transfer.numel() > 0:
+            grt_lr = training_args.grt_transfer_lr if getattr(training_args, "use_grt", False) else 0.0
+            l.append({'params': [self._grt_transfer], 'lr': grt_lr, "name": "grt_transfer"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -801,6 +1011,8 @@ class GaussianModel:
             l.append('ncif_dir_{}'.format(i))
         for i in range(self._prt_occlusion.shape[1]):
             l.append('prt_occlusion_{}'.format(i))
+        for i in range(self._grt_transfer.shape[1]):
+            l.append('grt_transfer_{}'.format(i))
 
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -825,6 +1037,7 @@ class GaussianModel:
         diffuse_color = self._diffuse_color.detach().cpu().numpy()  
         ncif_dir = self._ncif_dir.detach().cpu().numpy()
         prt_occlusion = self._prt_occlusion.detach().cpu().numpy()
+        grt_transfer = self._grt_transfer.detach().cpu().numpy() if self._grt_transfer.numel() > 0 else np.zeros((xyz.shape[0], 0))
         
         normals1 = self._normal1.detach().cpu().numpy()
         normals2 = self._normal2.detach().cpu().numpy() 
@@ -837,7 +1050,7 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
 
-        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, ncif_dir, prt_occlusion, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals1, normals2, f_dc, f_rest, ind_dc, ind_rest, ind_asg, opacities, refl_strength, metalness, roughness, ori_color, diffuse_color, ncif_dir, prt_occlusion, grt_transfer, scale, rotation), axis=1)
 
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
@@ -1093,7 +1306,7 @@ class GaussianModel:
             for idx, attr_name in enumerate(ncif_names):
                 ncif_dir[:, idx] = np.asarray(plydata.elements[0][attr_name])
         else:
-            ncif_dir = np.zeros((xyz.shape[0], 3))
+            ncif_dir = np.zeros((xyz.shape[0], 0))
         prt_occ_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("prt_occlusion_")]
         prt_occ_names = sorted(prt_occ_names, key=lambda x: int(x.split('_')[-1]))
         if prt_occ_names:
@@ -1101,8 +1314,15 @@ class GaussianModel:
             for idx, attr_name in enumerate(prt_occ_names):
                 prt_occlusion[:, idx] = np.asarray(plydata.elements[0][attr_name])
         else:
-            init_occ = inverse_sigmoid(torch.tensor([0.75])).item()
-            prt_occlusion = np.ones((xyz.shape[0], 1)) * init_occ
+            prt_occlusion = np.zeros((xyz.shape[0], 0))
+        grt_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("grt_transfer_")]
+        grt_names = sorted(grt_names, key=lambda x: int(x.split('_')[-1]))
+        if grt_names:
+            grt_transfer = np.zeros((xyz.shape[0], len(grt_names)))
+            for idx, attr_name in enumerate(grt_names):
+                grt_transfer[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        else:
+            grt_transfer = np.zeros((xyz.shape[0], 0))
         
         roughness = np.asarray(plydata.elements[0]["roughness"])[..., np.newaxis] # #
         metalness = np.asarray(plydata.elements[0]["metalness"])[..., np.newaxis] # #
@@ -1212,6 +1432,8 @@ class GaussianModel:
         self._diffuse_color = nn.Parameter(torch.tensor(diffuse_color, dtype=torch.float, device="cuda").requires_grad_(True))   # #
         self._ncif_dir = nn.Parameter(torch.tensor(ncif_dir, dtype=torch.float, device="cuda").requires_grad_(True))
         self._prt_occlusion = nn.Parameter(torch.tensor(prt_occlusion, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._grt_transfer = nn.Parameter(torch.tensor(grt_transfer, dtype=torch.float, device="cuda").requires_grad_(True)) if grt_transfer.shape[1] > 0 else torch.empty((xyz.shape[0], 0), device="cuda")
+        self.grt_sh_degree = int(round(grt_transfer.shape[1] ** 0.5)) - 1 if grt_transfer.shape[1] > 0 else 0
 
         self._normal1 = nn.Parameter(torch.tensor(normal1, dtype=torch.float, device="cuda").requires_grad_(True))       # #
         self._normal2 = nn.Parameter(torch.tensor(normal2, dtype=torch.float, device="cuda").requires_grad_(True))       # #
@@ -1279,8 +1501,16 @@ class GaussianModel:
         self._normal2 = optimizable_tensors["normal2"]        # #
         if "ncif_dir" in optimizable_tensors:
             self._ncif_dir = optimizable_tensors["ncif_dir"]
+        else:
+            self._ncif_dir = torch.empty((self._xyz.shape[0], 0), device="cuda")
         if "prt_occlusion" in optimizable_tensors:
             self._prt_occlusion = optimizable_tensors["prt_occlusion"]
+        else:
+            self._prt_occlusion = torch.empty((self._xyz.shape[0], 0), device="cuda")
+        if "grt_transfer" in optimizable_tensors:
+            self._grt_transfer = optimizable_tensors["grt_transfer"]
+        else:
+            self._grt_transfer = torch.empty((self._xyz.shape[0], 0), device="cuda")
 
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -1319,7 +1549,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
+    def densification_postfix(self, new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_grt_transfer, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2):
         d = {"xyz": new_xyz,
              
         "refl_strength": new_refl_strength,    # #
@@ -1329,6 +1559,7 @@ class GaussianModel:
         "diffuse_color": new_diffuse_color,    # #
         "ncif_dir": new_ncif_dir,
         "prt_occlusion": new_prt_occlusion,
+        "grt_transfer": new_grt_transfer,
         "normal1" : new_normal1,       # #
         "normal2" : new_normal2,       # #
 
@@ -1353,8 +1584,16 @@ class GaussianModel:
         self._diffuse_color = optimizable_tensors['diffuse_color']    # #
         if "ncif_dir" in optimizable_tensors:
             self._ncif_dir = optimizable_tensors["ncif_dir"]
+        else:
+            self._ncif_dir = torch.empty((self._xyz.shape[0], 0), device="cuda")
         if "prt_occlusion" in optimizable_tensors:
             self._prt_occlusion = optimizable_tensors["prt_occlusion"]
+        else:
+            self._prt_occlusion = torch.empty((self._xyz.shape[0], 0), device="cuda")
+        if "grt_transfer" in optimizable_tensors:
+            self._grt_transfer = optimizable_tensors["grt_transfer"]
+        else:
+            self._grt_transfer = torch.empty((self._xyz.shape[0], 0), device="cuda")
         self._normal1 = optimizable_tensors["normal1"]        # #
         self._normal2 = optimizable_tensors["normal2"]        # #
 
@@ -1395,6 +1634,7 @@ class GaussianModel:
         new_diffuse_color = self._diffuse_color[selected_pts_mask].repeat(N,1)   # #
         new_ncif_dir = self._ncif_dir[selected_pts_mask].repeat(N,1)
         new_prt_occlusion = self._prt_occlusion[selected_pts_mask].repeat(N,1)
+        new_grt_transfer = self._grt_transfer[selected_pts_mask].repeat(N,1)
         new_roughness = self._roughness[selected_pts_mask].repeat(N,1)   # #
         new_metalness = self._metalness[selected_pts_mask].repeat(N,1)   # #
         new_normal1 = self._normal1[selected_pts_mask].repeat(N,1)        # #
@@ -1409,7 +1649,7 @@ class GaussianModel:
         
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_grt_transfer, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacity, new_scaling, new_rotation, new_normal1, new_normal2)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1429,6 +1669,7 @@ class GaussianModel:
         new_diffuse_color = self._diffuse_color[selected_pts_mask]   # #
         new_ncif_dir = self._ncif_dir[selected_pts_mask]
         new_prt_occlusion = self._prt_occlusion[selected_pts_mask]
+        new_grt_transfer = self._grt_transfer[selected_pts_mask]
         new_normal1 = self._normal1[selected_pts_mask]       # #
         new_normal2 = self._normal2[selected_pts_mask]       # #
 
@@ -1443,7 +1684,7 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
+        self.densification_postfix(new_xyz, new_refl_strength, new_metalness, new_roughness, new_ori_color, new_diffuse_color, new_ncif_dir, new_prt_occlusion, new_grt_transfer, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_asg, new_indirect_rest, new_opacities, new_scaling, new_rotation, new_normal1, new_normal2)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

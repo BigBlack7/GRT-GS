@@ -23,17 +23,15 @@ def render_set(model_path, views, gaussians, pipeline, background, save_ims, opt
         render_path = os.path.join(model_path, "test", "renders")
         color_path = os.path.join(render_path, 'rgb')
         normal_path = os.path.join(render_path, 'normal')
-        probe_path = os.path.join(render_path, 'probe')
-        probe_resp_path = os.path.join(render_path, 'probe_responsibility')
-        prt_path = os.path.join(render_path, 'prt')
-        prt_resp_path = os.path.join(render_path, 'prt_responsibility')
+        grt_path = os.path.join(render_path, 'grt')
+        grt_probe_path = os.path.join(render_path, 'grt_probe')
+        grt_visibility_path = os.path.join(render_path, 'grt_visibility')
         spec_reliability_path = os.path.join(render_path, 'specular_reliability')
         makedirs(color_path, exist_ok=True)
         makedirs(normal_path, exist_ok=True)
-        makedirs(probe_path, exist_ok=True)
-        makedirs(probe_resp_path, exist_ok=True)
-        makedirs(prt_path, exist_ok=True)
-        makedirs(prt_resp_path, exist_ok=True)
+        makedirs(grt_path, exist_ok=True)
+        makedirs(grt_probe_path, exist_ok=True)
+        makedirs(grt_visibility_path, exist_ok=True)
         makedirs(spec_reliability_path, exist_ok=True)
 
     ssims = []
@@ -73,18 +71,15 @@ def render_set(model_path, views, gaussians, pipeline, background, save_ims, opt
             if 'rend_normal' in rendering:
                 normal_map = rendering['rend_normal'] * 0.5 + 0.5
                 torchvision.utils.save_image(normal_map, os.path.join(normal_path, '{0:05d}.png'.format(idx)))
-            if 'probe_map' in rendering:
-                probe_map = torch.tanh(rendering['probe_map']) * 0.5 + 0.5
-                torchvision.utils.save_image(probe_map, os.path.join(probe_path, '{0:05d}.png'.format(idx)))
-            if 'probe_responsibility' in rendering:
-                probe_resp = rendering['probe_responsibility'].repeat(3, 1, 1)
-                torchvision.utils.save_image(probe_resp, os.path.join(probe_resp_path, '{0:05d}.png'.format(idx)))
-            if 'prt_map' in rendering:
-                prt_map = torch.tanh(rendering['prt_map']) * 0.5 + 0.5
-                torchvision.utils.save_image(prt_map, os.path.join(prt_path, '{0:05d}.png'.format(idx)))
-            if 'prt_responsibility' in rendering:
-                prt_resp = rendering['prt_responsibility'].repeat(3, 1, 1)
-                torchvision.utils.save_image(prt_resp, os.path.join(prt_resp_path, '{0:05d}.png'.format(idx)))
+            if 'grt_map' in rendering:
+                grt_map = torch.tanh(rendering['grt_map']) * 0.5 + 0.5
+                torchvision.utils.save_image(grt_map, os.path.join(grt_path, '{0:05d}.png'.format(idx)))
+            if 'grt_probe_map' in rendering:
+                grt_probe = torch.tanh(rendering['grt_probe_map']) * 0.5 + 0.5
+                torchvision.utils.save_image(grt_probe, os.path.join(grt_probe_path, '{0:05d}.png'.format(idx)))
+            if 'grt_visibility' in rendering:
+                grt_visibility = rendering['grt_visibility'].repeat(3, 1, 1)
+                torchvision.utils.save_image(grt_visibility, os.path.join(grt_visibility_path, '{0:05d}.png'.format(idx)))
             if 'specular_reliability' in rendering:
                 spec_rel = rendering['specular_reliability'].repeat(3, 1, 1)
                 torchvision.utils.save_image(spec_rel, os.path.join(spec_reliability_path, '{0:05d}.png'.format(idx)))
@@ -149,9 +144,10 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         iteration = scene.loaded_iter
         if iteration is None:
             iteration = searchForMaxIteration(os.path.join(dataset.model_path, "point_cloud"))
-        op.enable_ncif = dataset.use_ncif and iteration >= op.ncif_from_iter
-        op.enable_probe_gi = getattr(op, "use_probe_gi", False) and iteration >= getattr(op, "probe_from_iter", 0)
-        op.enable_prt_gs = getattr(op, "use_prt_gs", False) and iteration >= getattr(op, "prt_from_iter", 0)
+        op.enable_ncif = False
+        op.enable_probe_gi = False
+        op.enable_prt_gs = False
+        op.enable_grt = getattr(op, "use_grt", False) and iteration >= getattr(op, "grt_from_iter", 0)
         op.current_iteration = iteration
         mesh_path = os.path.join(dataset.model_path, f'test_{iteration:06d}.ply')
         use_indirect = (iteration >= op.indirect_from_iter and os.path.exists(mesh_path)) if indirect_override is None else indirect_override
@@ -163,9 +159,7 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         print(
             "Loaded eval state: "
             f"iteration={iteration}, "
-            f"enable_ncif={op.enable_ncif}, "
-            f"enable_probe_gi={op.enable_probe_gi}, "
-            f"enable_prt_gs={op.enable_prt_gs}, "
+            f"enable_grt={op.enable_grt}, "
             f"indirect={op.indirect}, "
             f"mesh_exists={os.path.exists(mesh_path)}"
         )
@@ -215,12 +209,9 @@ if __name__ == "__main__":
     print(
         "Eval config: "
         f"iteration={args.iteration}, "
-        f"use_ncif={dataset.use_ncif}, "
-        f"ncif_from_iter={opt.ncif_from_iter}, "
-        f"use_probe_gi={opt.use_probe_gi}, "
-        f"probe_from_iter={opt.probe_from_iter}, "
-        f"use_prt_gs={opt.use_prt_gs}, "
-        f"prt_from_iter={opt.prt_from_iter}, "
+        f"use_grt={opt.use_grt}, "
+        f"grt_from_iter={opt.grt_from_iter}, "
+        f"grt_mode={opt.grt_mode}, "
         f"srgb={opt.srgb}, "
         f"indirect_override={args.indirect_override}"
     )
