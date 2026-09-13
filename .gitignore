@@ -1,1 +1,10 @@
-.idea
+.idea/
+
+# Local research drafts, experiment scripts, and records
+/historical_experiments/
+
+# Python caches and local training outputs
+__pycache__/
+*.py[cod]
+/output/
+/runs/

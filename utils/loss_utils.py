@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
@@ -85,6 +86,76 @@ def cubemap_tv_loss(cubemap):
     return (value[:, 1:, :, :] - value[:, :-1, :, :]).abs().mean() + (value[:, :, 1:, :] - value[:, :, :-1, :]).abs().mean()
 
 
+_VGG16_PERCEPTUAL = None
+_VGG16_LOAD_FAILED = False
+
+
+class VGG16PerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        try:
+            from torchvision.models import VGG16_Weights, vgg16
+            weights = VGG16_Weights.DEFAULT
+            features = vgg16(weights=weights).features[:16]
+        except Exception:
+            from torchvision.models import vgg16
+            features = vgg16(pretrained=True).features[:16]
+
+        self.features = features.eval()
+        for param in self.features.parameters():
+            param.requires_grad_(False)
+
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+
+    def _prepare(self, image, max_size=512):
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        if image.shape[1] == 1:
+            image = image.repeat(1, 3, 1, 1)
+        image = image[:, :3].clamp(0.0, 1.0)
+
+        h, w = image.shape[-2:]
+        max_side = max(h, w)
+        if max_side > max_size:
+            scale = max_size / float(max_side)
+            image = F.interpolate(
+                image,
+                size=(max(1, int(round(h * scale))), max(1, int(round(w * scale)))),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return (image - self.mean) / self.std
+
+    def forward(self, pred, target):
+        pred = self._prepare(pred)
+        target = self._prepare(target)
+        pred_features = self.features(pred)
+        with torch.no_grad():
+            target_features = self.features(target)
+        return F.l1_loss(pred_features, target_features)
+
+
+def perceptual_loss(rendered_image, gt_image):
+    global _VGG16_PERCEPTUAL, _VGG16_LOAD_FAILED
+    if _VGG16_LOAD_FAILED:
+        return None
+
+    if _VGG16_PERCEPTUAL is None:
+        try:
+            _VGG16_PERCEPTUAL = VGG16PerceptualLoss().to(rendered_image.device)
+        except Exception as exc:
+            _VGG16_LOAD_FAILED = True
+            print(f"[Warning] VGG16 perceptual loss disabled: {exc}")
+            return None
+    elif next(_VGG16_PERCEPTUAL.parameters()).device != rendered_image.device:
+        _VGG16_PERCEPTUAL = _VGG16_PERCEPTUAL.to(rendered_image.device)
+
+    return _VGG16_PERCEPTUAL(rendered_image, gt_image)
+
+
 
 def calculate_loss(viewpoint_camera, pc, render_pkg, opt, iteration):
     tb_dict = {
@@ -108,6 +179,16 @@ def calculate_loss(viewpoint_camera, pc, render_pkg, opt, iteration):
     tb_dict["ssim"] = ssim_val.item()
     tb_dict["loss0"] = loss0.item()
     loss += loss0
+
+    if getattr(opt, "lambda_perc", 0.0) > 0:
+        loss_perc = perceptual_loss(rendered_image, gt_image)
+        if loss_perc is not None:
+            tb_dict["loss_perc"] = loss_perc.item()
+            loss = loss + opt.lambda_perc * loss_perc
+        else:
+            tb_dict["loss_perc"] = torch.zeros_like(loss)
+    else:
+        tb_dict["loss_perc"] = torch.zeros_like(loss)
 
     if opt.lambda_normal_render_depth > 0 and iteration > opt.normal_loss_start:
         surf_normal = render_pkg['surf_normal']

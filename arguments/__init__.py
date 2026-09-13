@@ -85,7 +85,7 @@ class ModelParams(ParamGroup):
         self.val_max = 8
 
         # EnvLight Settings
-        self.envmap_max_res = 128
+        self.envmap_max_res = 256
         self.envmap_max_roughness = 0.5
         self.envmap_min_roughness = 0.08
         self.relight = False
@@ -145,6 +145,7 @@ class OptimizationParams(ParamGroup):
 
         # Regularization Parameters
         self.lambda_dssim = 0.2
+        self.lambda_perc = 0.0
         self.lambda_dist = 0.0
         self.lambda_normal_render_depth = 0.05
         self.lambda_normal_smooth = 0.0
